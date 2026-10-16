@@ -988,7 +988,7 @@ st.markdown(
     <style>
     /* Change the font size of the metric number/value */
     [data-testid="stMetricValue"] {
-        font-size: 14px !important;
+        font-size: 20px !important;
     }
     
     /* Change the font size of the metric top label */
@@ -1017,13 +1017,13 @@ m[2].metric(
 )
 
 m[3].metric(
-    "Upper BE",
-    f"{upper_breakeven:,.2f}"
+    "Upper BE Strike",
+    f"{upper_strike:,.2f}"
 )
 
 m[4].metric(
-    "Lower BE",
-    f"{lower_breakeven:,.2f}"
+    "Lower BE Strike",
+    f"{lower_strike:,.2f}"
 )
 
 m[5].metric(
