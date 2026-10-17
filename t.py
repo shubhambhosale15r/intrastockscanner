@@ -12,6 +12,11 @@ st.set_page_config(
     layout="wide"
 )
 
+
+# ---------------------------------------------------------------------------
+# Fyers API calls (no caching: every rerun fetches live data)
+# ---------------------------------------------------------------------------
+
 def get_fyers(client_id, access_token):
     return fyersModel.FyersModel(
         client_id=client_id,
@@ -20,18 +25,16 @@ def get_fyers(client_id, access_token):
         log_path=""
     )
 
-@st.cache_data(ttl=5, show_spinner=False)
-def fetch_chain(_fyers, symbol, strikecount, timestamp):
-    return _fyers.optionchain(data={
+def fetch_chain(fyers, symbol, strikecount, timestamp):
+    return fyers.optionchain(data={
         "symbol": symbol,
         "strikecount": int(strikecount),
         "timestamp": int(timestamp),
         "greeks": "1"
     })
 
-@st.cache_data(ttl=5, show_spinner=False)
-def fetch_spot(_fyers, symbol):
-    response = _fyers.quotes({"symbols": symbol})
+def fetch_spot(fyers, symbol):
+    response = fyers.quotes({"symbols": symbol})
 
     if response.get("s") != "ok":
         raise RuntimeError(f"Spot quote failed: {response}")
@@ -54,8 +57,7 @@ def fetch_spot(_fyers, symbol):
 
     return float(lp)
 
-@st.cache_data(ttl=5, show_spinner=False)
-def fetch_option_quotes(_fyers, symbols):
+def fetch_option_quotes(fyers, symbols):
     symbols = tuple(dict.fromkeys(symbols))
 
     if not symbols:
@@ -64,7 +66,7 @@ def fetch_option_quotes(_fyers, symbols):
     if len(symbols) > 50:
         raise ValueError("Quotes API accepts a maximum of 50 symbols per request.")
 
-    response = _fyers.quotes({
+    response = fyers.quotes({
         "symbols": ",".join(symbols)
     })
 
@@ -94,6 +96,11 @@ def fetch_option_quotes(_fyers, symbols):
 
     return quotes
 
+
+# ---------------------------------------------------------------------------
+# Option chain helpers
+# ---------------------------------------------------------------------------
+
 def get_expiry_data(chain_response):
     data = chain_response.get("data", {})
     return data.get("expiryData", [])
@@ -103,7 +110,7 @@ def get_option_chain_rows(chain_response):
     return data.get("optionsChain", [])
 
 def format_expiry(expiry_item):
-    expiry_date = expiry_item.get("expiryDate")
+    expiry_date = expiry_item.get("expiryDate") or expiry_item.get("date")
     expiry_epoch = expiry_item.get("expiry")
 
     if expiry_date:
@@ -152,6 +159,26 @@ def build_option_map(chain):
         option_map[strike][option_type] = symbol
 
     return option_map
+
+def build_greeks_map(chain):
+    """LTP, delta and theta all taken from the same chain row,
+    so they always belong to the same snapshot."""
+    greeks_map = {}
+
+    for row in chain:
+        symbol = row.get("symbol")
+        greeks = row.get("greeks")
+
+        if not symbol or not isinstance(greeks, dict):
+            continue
+
+        greeks_map[symbol] = {
+            "ltp": row.get("ltp"),
+            "delta": greeks.get("delta"),
+            "theta": greeks.get("theta")
+        }
+
+    return greeks_map
 
 def select_three_strikes(option_map, spot):
     strikes = sorted(option_map.keys())
@@ -229,6 +256,17 @@ def valid_number(value):
     except (TypeError, ValueError):
         return False
 
+def theta_ratio(theta, ltp, delta):
+    if not all(valid_number(x) for x in (theta, ltp, delta)):
+        return None
+
+    denominator = float(ltp) * abs(float(delta))
+
+    if denominator == 0:
+        return None
+
+    return abs(float(theta)) / denominator
+
 def calculate_deviations(selected_strikes, option_map, quotes):
     rows = []
 
@@ -295,6 +333,11 @@ def calculate_deviations(selected_strikes, option_map, quotes):
         float(average_pe_deviation)
     )
 
+
+# ---------------------------------------------------------------------------
+# Time / refresh helpers
+# ---------------------------------------------------------------------------
+
 def get_ist_time():
     return datetime.now(
         ZoneInfo("Asia/Kolkata")
@@ -307,32 +350,24 @@ def format_ist_time(dt):
         "%d-%b-%Y %I:%M:%S %p IST"
     )
 
-def ms_until_next_minute():
-    now = pd.Timestamp.now()
-    next_minute = now.ceil("min")
-
-    milliseconds = int(
-        (next_minute - now).total_seconds() * 1000
-    )
-
-    return max(milliseconds, 100)
-
-def install_autorefresh(enabled, mode, fixed_seconds):
+def install_autorefresh(enabled, refresh_seconds):
     if not enabled:
         return
 
-    if mode == "Next minute":
-        interval = ms_until_next_minute()
-    else:
-        interval = max(
-            int(fixed_seconds * 1000),
-            1000
-        )
+    interval = max(
+        int(refresh_seconds * 1000),
+        1000
+    )
 
     st_autorefresh(
         interval=interval,
         key="nifty_atp_refresh"
     )
+
+
+# ---------------------------------------------------------------------------
+# Paper trade state
+# ---------------------------------------------------------------------------
 
 def initialize_paper_state():
     if "paper_trade" not in st.session_state:
@@ -538,6 +573,11 @@ def exit_paper_trade(
     st.session_state.paper_trade = None
     st.session_state.manual_close_requested = False
 
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
 initialize_paper_state()
 
 st.title("NIFTY CE/PE ATP Paper Trade")
@@ -588,16 +628,11 @@ with st.sidebar:
         value=True
     )
 
-    refresh_mode = st.selectbox(
-        "Refresh Mode",
-        ["Next minute", "Fixed seconds"]
-    )
-
-    fixed_seconds = st.number_input(
-        "Fixed Seconds",
+    refresh_seconds = st.number_input(
+        "Refresh Every (seconds)",
         min_value=1,
         max_value=3600,
-        value=5,
+        value=15,
         step=1
     )
 
@@ -620,8 +655,7 @@ with st.sidebar:
 
 install_autorefresh(
     autorefresh_enabled,
-    refresh_mode,
-    fixed_seconds
+    refresh_seconds
 )
 
 last_refreshed = get_ist_time()
@@ -804,6 +838,19 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
+# Both CE and PE at each breakeven strike (used for the theta ratio table)
+be_legs = []
+
+for be_label, be_strike in (
+    ("Upper BE", upper_strike),
+    ("Lower BE", lower_strike)
+):
+    for opt in ("CE", "PE"):
+        sym = option_map[be_strike].get(opt)
+        if sym:
+            be_legs.append((be_label, be_strike, opt, sym))
+
+# Symbols needed from the quotes API
 trade_symbols = []
 
 for strike in selected_strikes:
@@ -862,6 +909,34 @@ except Exception as e:
         f"Deviation calculation failed: {e}"
     )
     st.stop()
+
+# Theta / (LTP x Delta) at breakeven strikes.
+# LTP, delta and theta all come from the same chain row.
+greeks_map = build_greeks_map(chain_rows)
+
+theta_rows = []
+
+for be_label, be_strike, opt, sym in be_legs:
+    g = greeks_map.get(sym, {})
+    g_ltp = g.get("ltp")
+    g_delta = g.get("delta")
+    g_theta = g.get("theta")
+
+    theta_rows.append({
+        "Level": be_label,
+        "Strike": be_strike,
+        "Type": opt,
+        "LTP (chain)": g_ltp,
+        "Delta": g_delta,
+        "Theta": g_theta,
+        "|Theta| / (LTP × |Delta|)": theta_ratio(
+            g_theta,
+            g_ltp,
+            g_delta
+        )
+    })
+
+theta_df = pd.DataFrame(theta_rows)
 
 buy_signal = check_buy_signal(
     average_ce_deviation,
@@ -990,7 +1065,7 @@ st.markdown(
     [data-testid="stMetricValue"] {
         font-size: 20px !important;
     }
-    
+
     /* Change the font size of the metric top label */
     [data-testid="stMetricLabel"] p {
         font-size: 14px !important;
@@ -1058,6 +1133,21 @@ st.dataframe(
     be_df,
     use_container_width=True,
     hide_index=True
+)
+
+st.subheader(
+    "Theta / (LTP × Delta) at Breakeven Strikes"
+)
+
+st.dataframe(
+    theta_df,
+    use_container_width=True,
+    hide_index=True
+)
+
+st.caption(
+    "Ratio = abs(Theta) / (LTP × abs(Delta)). "
+    "LTP, Delta and Theta are all from the same option chain snapshot."
 )
 
 st.subheader(
@@ -1390,6 +1480,10 @@ with st.expander(
         r"Lower\ BE=Spot-ATM\ Straddle"
     )
 
+    st.latex(
+        r"Theta\ Ratio=\frac{|\Theta|}{LTP\times|\Delta|}"
+    )
+
     st.write(
         "Buy signal: Avg CE Dev > 0, Avg PE Dev < 0, "
         "and abs(Avg PE Dev) > 1.5 × abs(Avg CE Dev)."
@@ -1429,5 +1523,4 @@ with st.expander(
 if st.button(
     "Manual Refresh"
 ):
-    st.cache_data.clear()
     st.rerun()
