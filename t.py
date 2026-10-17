@@ -854,16 +854,26 @@ except Exception as e:
     st.stop()
 
 # Both CE and PE at each breakeven strike (used for the theta ratio table)
+# be_legs = []
+
+# for be_label, be_strike in (
+#     ("Upper BE", upper_strike),
+#     ("Lower BE", lower_strike)
+# ):
+#     for opt in ("CE", "PE"):
+#         sym = option_map[be_strike].get(opt)
+#         if sym:
+#             be_legs.append((be_label, be_strike, opt, sym))
+#Upper be ce and lower be pe data only
 be_legs = []
 
-for be_label, be_strike in (
-    ("Upper BE", upper_strike),
-    ("Lower BE", lower_strike)
+for be_label, be_strike, opt in (
+    ("Upper BE", upper_strike, "CE"),
+    ("Lower BE", lower_strike, "PE")
 ):
-    for opt in ("CE", "PE"):
-        sym = option_map[be_strike].get(opt)
-        if sym:
-            be_legs.append((be_label, be_strike, opt, sym))
+    sym = option_map[be_strike].get(opt)
+    if sym:
+        be_legs.append((be_label, be_strike, opt, sym))
 
 # Symbols needed from the quotes API
 trade_symbols = []
