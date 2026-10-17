@@ -350,17 +350,32 @@ def format_ist_time(dt):
         "%d-%b-%Y %I:%M:%S %p IST"
     )
 
+def ms_until_next_boundary(step_seconds, buffer_ms=300):
+    """Milliseconds until the next wall-clock multiple of step_seconds,
+    measured from IST midnight. Examples:
+      15s -> :00, :15, :30, :45 of every minute
+      60s -> top of every minute (10:00, 10:01, 10:02 ...)
+    A small buffer makes the rerun land just after the boundary so the
+    fresh candle/quote data is already available."""
+    step_ms = max(int(step_seconds), 1) * 1000
+
+    now = get_ist_time()
+    ms_since_midnight = (
+        ((now.hour * 60 + now.minute) * 60 + now.second) * 1000
+        + now.microsecond // 1000
+    )
+
+    remainder = ms_since_midnight % step_ms
+    wait = step_ms - remainder + buffer_ms
+
+    return int(max(wait, 200))
+
 def install_autorefresh(enabled, refresh_seconds):
     if not enabled:
         return
 
-    interval = max(
-        int(refresh_seconds * 1000),
-        1000
-    )
-
     st_autorefresh(
-        interval=interval,
+        interval=ms_until_next_boundary(refresh_seconds),
         key="nifty_atp_refresh"
     )
 
