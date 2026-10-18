@@ -386,7 +386,7 @@ with st.sidebar:
         "Strike Count",
         min_value=1,
         max_value=50,
-        value=10,
+        value=15,
         step=1
     )
 
