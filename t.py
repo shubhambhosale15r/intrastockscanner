@@ -824,61 +824,6 @@ st.caption(
     "strikes and are the same values shown as Avg CE Dev. / Avg PE Dev. in "
     "the top metrics."
 )
-
-with st.expander("Calculation"):
-        for _, row in calculation_df.iterrows():
-        st.write(
-            f"**{row['Strike']:,.0f}** → "
-            f"CE: {row['CE LTP']:,.2f} − {row['CE ATP']:,.2f} = "
-            f"**{row['CE LTP-ATP']:+,.2f}** | "
-            f"PE: {row['PE LTP']:,.2f} − {row['PE ATP']:,.2f} = "
-            f"**{row['PE LTP-ATP']:+,.2f}**"
-        )
-    
-    ce_values = calculation_df["CE LTP-ATP"].tolist()
-    pe_values = calculation_df["PE LTP-ATP"].tolist()
-    
-    ce_values_text = " + ".join(f"({x:+,.2f})" for x in ce_values)
-    pe_values_text = " + ".join(f"({x:+,.2f})" for x in pe_values)
-    
-    st.write(
-        f"**Average CE Dev:** ({ce_values_text}) / {len(ce_values)} = "
-        f"**{average_ce_deviation:+,.2f}**"
-    )
-    
-    st.write(
-        f"**Average PE Dev:** ({pe_values_text}) / {len(pe_values)} = "
-        f"**{average_pe_deviation:+,.2f}**"
-    )
-    
-    for _, row in share_df.iterrows():
-        st.write(
-            f"**{row['Strike']:,.0f}** → "
-            f"CE: {row['CE LTP']:,.2f} / "
-            f"({row['CE LTP']:,.2f} + {row['PE LTP']:,.2f}) = "
-            f"**{row['CE / (CE+PE) %']:.1f}%** | "
-            f"PE: {row['PE LTP']:,.2f} / "
-            f"({row['CE LTP']:,.2f} + {row['PE LTP']:,.2f}) = "
-            f"**{row['PE / (CE+PE) %']:.1f}%**"
-        )
-    
-    ce_share_text = " + ".join(
-        f"{x:.1f}%" for x in share_df["CE / (CE+PE) %"].tolist()
-    )
-    pe_share_text = " + ".join(
-        f"{x:.1f}%" for x in share_df["PE / (CE+PE) %"].tolist()
-    )
-    
-    st.write(
-        f"**Avg CE / (CE + PE):** ({ce_share_text}) / {len(share_df)} = "
-        f"**{avg_ce_share:.1f}%**"
-    )
-    
-    st.write(
-        f"**Avg PE / (CE + PE):** ({pe_share_text}) / {len(share_df)} = "
-        f"**{avg_pe_share:.1f}%**"
-    )
-
 # --- Calculation breakdown -------------------------------------------------
 st.subheader("Calculation")
 
