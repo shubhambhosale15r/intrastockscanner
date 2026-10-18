@@ -14,7 +14,7 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Fyers API calls (no caching: every rerun fetches live data)
+# Fyers API calls
 # ---------------------------------------------------------------------------
 
 def get_fyers(client_id, access_token):
@@ -35,55 +35,47 @@ def fetch_chain(fyers, symbol, strikecount, timestamp):
 
 def fetch_spot(fyers, symbol):
     response = fyers.quotes({"symbols": symbol})
-
     if response.get("s") != "ok":
         raise RuntimeError(f"Spot quote failed: {response}")
-
     data = response.get("d", [])
     if not data:
         raise RuntimeError(f"Spot quote returned no data: {response}")
-
     item = data[0]
     if item.get("s") != "ok":
         raise RuntimeError(f"Spot quote failed: {item}")
-
     value = item.get("v", {})
     lp = value.get("lp")
-
     if lp is None or pd.isna(lp):
         raise RuntimeError(f"Spot LTP unavailable: {item}")
-
     return float(lp)
 
 def fetch_option_quotes(fyers, symbols):
-    symbols = tuple(dict.fromkeys(symbols))
+    """Fetch quotes in batches of 50 (Fyers API limit)."""
+    symbols = list(dict.fromkeys(symbols))
     if not symbols:
         return {}
 
-    if len(symbols) > 50:
-        raise ValueError("Quotes API accepts a maximum of 50 symbols per request.")
-
-    response = fyers.quotes({"symbols": ",".join(symbols)})
-
-    if response.get("s") != "ok":
-        raise RuntimeError(f"Option quotes failed: {response}")
-
     quotes = {}
-    for item in response.get("d", []):
-        if item.get("s") != "ok":
-            continue
-        value = item.get("v", {})
-        symbol = item.get("n") or value.get("symbol")
-        if not symbol:
-            continue
-        quotes[symbol] = {
-            "symbol": symbol,
-            "lp": value.get("lp"),
-            "atp": value.get("atp"),
-            "bid": value.get("bid"),
-            "ask": value.get("ask"),
-            "volume": value.get("volume")
-        }
+    for i in range(0, len(symbols), 50):
+        batch = symbols[i:i + 50]
+        response = fyers.quotes({"symbols": ",".join(batch)})
+        if response.get("s") != "ok":
+            raise RuntimeError(f"Option quotes failed: {response}")
+        for item in response.get("d", []):
+            if item.get("s") != "ok":
+                continue
+            value = item.get("v", {})
+            symbol = item.get("n") or value.get("symbol")
+            if not symbol:
+                continue
+            quotes[symbol] = {
+                "symbol": symbol,
+                "lp": value.get("lp"),
+                "atp": value.get("atp"),
+                "bid": value.get("bid"),
+                "ask": value.get("ask"),
+                "volume": value.get("volume"),
+            }
     return quotes
 
 
@@ -100,7 +92,6 @@ def get_option_chain_rows(chain_response):
 def format_expiry(expiry_item):
     expiry_date = expiry_item.get("expiryDate") or expiry_item.get("date")
     expiry_epoch = expiry_item.get("expiry")
-
     if expiry_date:
         return str(expiry_date)
     if expiry_epoch:
@@ -116,7 +107,6 @@ def get_expiry_value(expiry_item):
 
 def build_option_map(chain):
     option_map = {}
-
     for row in chain:
         option_type = row.get("option_type")
         strike_price = row.get("strike_price")
@@ -125,74 +115,58 @@ def build_option_map(chain):
             or row.get("name")
             or row.get("original_name")
         )
-
         if option_type not in ("CE", "PE"):
             continue
         if strike_price is None or symbol is None:
             continue
-
         try:
             strike = float(strike_price)
         except (TypeError, ValueError):
             continue
-
         option_map.setdefault(strike, {})
         option_map[strike][option_type] = symbol
-
     return option_map
 
 def build_greeks_map(chain):
     greeks_map = {}
-
     for row in chain:
         symbol = row.get("symbol")
         greeks = row.get("greeks")
-
         if not symbol or not isinstance(greeks, dict):
             continue
-
         greeks_map[symbol] = {
             "ltp": row.get("ltp"),
             "delta": greeks.get("delta"),
             "theta": greeks.get("theta")
         }
-
     return greeks_map
 
 def calculate_synthetic_future(selected_strikes, option_map, quotes):
     rows = []
-
     for strike in selected_strikes:
         ce_symbol = option_map[strike]["CE"]
         pe_symbol = option_map[strike]["PE"]
-
         ce_quote = quotes.get(ce_symbol)
         pe_quote = quotes.get(pe_symbol)
-
         if not ce_quote:
             raise RuntimeError(f"CE quote missing: {ce_symbol}")
         if not pe_quote:
             raise RuntimeError(f"PE quote missing: {pe_symbol}")
-
         ce_ltp = ce_quote.get("lp")
         pe_ltp = pe_quote.get("lp")
-
         if not (valid_number(ce_ltp) and valid_number(pe_ltp)):
             raise RuntimeError(
                 f"Invalid LTP for synthetic future at strike {strike}: "
                 f"CE={ce_ltp}, PE={pe_ltp}"
             )
-
         ce_ltp = float(ce_ltp)
         pe_ltp = float(pe_ltp)
-
         rows.append({
             "Strike": strike,
             "CE LTP": ce_ltp,
             "PE LTP": pe_ltp,
             "Synthetic Future": strike + ce_ltp - pe_ltp
         })
-
     df = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
     return df, float(df["Synthetic Future"].mean())
 
@@ -210,21 +184,17 @@ def find_closest_strike(option_map, price):
 
 def select_three_around(option_map, center_strike):
     strikes = both_leg_strikes(option_map)
-
     if len(strikes) < 3:
         raise RuntimeError(
             "Fewer than 3 strikes with both CE and PE are available."
         )
-
     if center_strike not in strikes:
         raise RuntimeError(
             f"Centre strike {center_strike:,.0f} is not in the loaded chain "
             f"(both-leg strikes: {int(strikes[0]):,}–{int(strikes[-1]):,}). "
             f"Increase Strike Count."
         )
-
     index = strikes.index(center_strike)
-
     if index == 0 or index == len(strikes) - 1:
         raise RuntimeError(
             f"{center_strike:,.0f} is at the edge of the loaded chain, so it "
@@ -232,29 +202,23 @@ def select_three_around(option_map, center_strike):
             f"window (loaded range {int(strikes[0]):,}–{int(strikes[-1]):,}). "
             f"Increase Strike Count in the sidebar."
         )
-
     window = strikes[index - 1:index + 2]
     step = min(b - a for a, b in zip(strikes, strikes[1:]))
-
     if max(b - a for a, b in zip(window, window[1:])) > step:
         raise RuntimeError(
             f"Strikes {[int(x) for x in window]} are not adjacent "
             f"(a CE or PE is missing in between). Increase Strike Count."
         )
-
     return window, None
 
 def find_breakeven_strikes(option_map, center, straddle):
     strikes = both_leg_strikes(option_map)
     if not strikes:
         raise RuntimeError("No strikes available for breakeven calculation.")
-
     upper_breakeven = center + straddle
     lower_breakeven = center - straddle
-
     upper_strike = min(strikes, key=lambda s: abs(s - upper_breakeven))
     lower_strike = min(strikes, key=lambda s: abs(s - lower_breakeven))
-
     if "CE" not in option_map[upper_strike]:
         raise RuntimeError(
             f"CE unavailable at upper breakeven strike {upper_strike}."
@@ -263,7 +227,6 @@ def find_breakeven_strikes(option_map, center, straddle):
         raise RuntimeError(
             f"PE unavailable at lower breakeven strike {lower_strike}."
         )
-
     return upper_breakeven, lower_breakeven, upper_strike, lower_strike
 
 def valid_number(value):
@@ -278,63 +241,10 @@ def theta_ratio(theta, delta):
     """|Theta| / |Delta|."""
     if not all(valid_number(x) for x in (theta, delta)):
         return None
-
     denominator = abs(float(delta))
     if denominator == 0:
         return None
-
     return abs(float(theta)) / denominator
-
-def calculate_deviations(selected_strikes, option_map, quotes):
-    rows = []
-
-    for strike in selected_strikes:
-        ce_symbol = option_map[strike]["CE"]
-        pe_symbol = option_map[strike]["PE"]
-
-        ce_quote = quotes.get(ce_symbol)
-        pe_quote = quotes.get(pe_symbol)
-
-        if not ce_quote:
-            raise RuntimeError(f"CE quote missing: {ce_symbol}")
-        if not pe_quote:
-            raise RuntimeError(f"PE quote missing: {pe_symbol}")
-
-        ce_ltp = ce_quote.get("lp")
-        ce_atp = ce_quote.get("atp")
-        pe_ltp = pe_quote.get("lp")
-        pe_atp = pe_quote.get("atp")
-
-        if not all(valid_number(x) for x in [ce_ltp, ce_atp, pe_ltp, pe_atp]):
-            raise RuntimeError(
-                f"Invalid quote data for strike {strike}: "
-                f"CE LTP={ce_ltp}, CE ATP={ce_atp}, "
-                f"PE LTP={pe_ltp}, PE ATP={pe_atp}"
-            )
-
-        ce_ltp = float(ce_ltp)
-        ce_atp = float(ce_atp)
-        pe_ltp = float(pe_ltp)
-        pe_atp = float(pe_atp)
-
-        rows.append({
-            "Strike": strike,
-            "CE Symbol": ce_symbol,
-            "CE ATP": ce_atp,
-            "CE LTP": ce_ltp,
-            "CE LTP-ATP": ce_ltp - ce_atp,
-            "PE Symbol": pe_symbol,
-            "PE LTP": pe_ltp,
-            "PE ATP": pe_atp,
-            "PE LTP-ATP": pe_ltp - pe_atp
-        })
-
-    result = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
-    return (
-        result,
-        float(result["CE LTP-ATP"].mean()),
-        float(result["PE LTP-ATP"].mean())
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +339,7 @@ if not expiry_data:
 expiry_labels = [format_expiry(item) for item in expiry_data]
 expiry_values = [get_expiry_value(item) for item in expiry_data]
 
-# --- Expiry selector — back inside the sidebar as its own section ----------
+# --- Expiry selector — inside the sidebar, own section ---------------------
 with st.sidebar:
     st.divider()
     st.subheader("Expiry")
@@ -510,12 +420,6 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-role_map = {
-    dev_strikes[0]: "Syn ATM−1",
-    dev_strikes[1]: "Syn ATM",
-    dev_strikes[2]: "Syn ATM+1",
-}
-
 # --- Step 3: straddle at Syn ATM -------------------------------------------
 atm_ce_symbol = option_map[atm]["CE"]
 atm_pe_symbol = option_map[atm]["PE"]
@@ -583,69 +487,168 @@ if abs(lower_strike - lower_breakeven) > strike_step:
         f"(nearest listed strike {lower_strike:,.0f}). Increase Strike Count."
     )
 
-# --- Step 5: deviations on the Syn ATM window ------------------------------
-try:
-    (
-        calculation_df,
-        average_ce_deviation,
-        average_pe_deviation
-    ) = calculate_deviations(dev_strikes, option_map, quotes)
-except Exception as e:
-    st.error(f"Deviation calculation failed: {e}")
+# --- Step 5: OTM CE and OTM PE strike windows ------------------------------
+all_loaded_strikes = both_leg_strikes(option_map)
+
+# OTM CE: strictly above Syn ATM, up to and including Upper BE strike
+otm_ce_strikes = [
+    s for s in all_loaded_strikes if atm < s <= upper_strike
+]
+
+# OTM PE: strictly below Syn ATM, down to and including Lower BE strike
+otm_pe_strikes = [
+    s for s in all_loaded_strikes if lower_strike <= s < atm
+]
+
+if not otm_ce_strikes:
+    st.error(
+        f"No OTM CE strikes between Syn ATM ({atm:,.0f}) and Upper BE strike "
+        f"({upper_strike:,.0f}). The straddle may be too small relative to "
+        f"the strike step, or the Upper BE falls on/inside the Syn ATM. "
+        f"Increase Strike Count or check the chain."
+    )
     st.stop()
 
-# --- Syn ATM-window synthetic future (display only) ------------------------
-syn_df_final, syn_fut_final = calculate_synthetic_future(
-    dev_strikes,
-    option_map,
-    quotes
-)
+if not otm_pe_strikes:
+    st.error(
+        f"No OTM PE strikes between Lower BE strike ({lower_strike:,.0f}) and "
+        f"Syn ATM ({atm:,.0f}). The straddle may be too small relative to "
+        f"the strike step, or the Lower BE falls on/inside the Syn ATM. "
+        f"Increase Strike Count or check the chain."
+    )
+    st.stop()
 
-# --- |Theta| / |Delta| at Syn ATM−1, Syn ATM, Syn ATM+1 -------------------
+all_otm_strikes = sorted(otm_ce_strikes + otm_pe_strikes)
+
+otm_role_map = {s: "OTM CE" for s in otm_ce_strikes}
+otm_role_map.update({s: "OTM PE" for s in otm_pe_strikes})
+
+# --- Step 6: fetch quotes for all OTM strikes -----------------------------
+otm_symbols = []
+for strike in all_otm_strikes:
+    otm_symbols.append(option_map[strike]["CE"])
+    otm_symbols.append(option_map[strike]["PE"])
+
+missing_otm_symbols = [
+    s for s in dict.fromkeys(otm_symbols)
+    if s not in quotes
+]
+
+if missing_otm_symbols:
+    trade_symbols.extend(missing_otm_symbols)
+    try:
+        quotes.update(fetch_option_quotes(fyers, missing_otm_symbols))
+    except Exception as e:
+        st.error(f"OTM strike quotes fetch failed: {e}")
+        st.stop()
+
+# --- Step 7: OTM-based deviations, theta, share ---------------------------
+otm_dev_rows = []
+otm_theta_rows = []
+otm_share_rows = []
+
+for strike in all_otm_strikes:
+    role = otm_role_map[strike]
+    ce_sym = option_map[strike]["CE"]
+    pe_sym = option_map[strike]["PE"]
+
+    ce_q = quotes.get(ce_sym)
+    pe_q = quotes.get(pe_sym)
+
+    if not ce_q or not pe_q:
+        st.error(f"Missing quote for OTM strike {strike:,.0f}")
+        st.stop()
+
+    if not (
+        valid_number(ce_q.get("lp")) and valid_number(ce_q.get("atp"))
+        and valid_number(pe_q.get("lp")) and valid_number(pe_q.get("atp"))
+    ):
+        st.error(f"Invalid quote data at OTM strike {strike:,.0f}")
+        st.stop()
+
+    ce_ltp = float(ce_q["lp"])
+    ce_atp = float(ce_q["atp"])
+    pe_ltp = float(pe_q["lp"])
+    pe_atp = float(pe_q["atp"])
+
+    otm_dev_rows.append({
+        "Role": role,
+        "Strike": strike,
+        "CE ATP": ce_atp,
+        "CE LTP": ce_ltp,
+        "CE LTP-ATP": ce_ltp - ce_atp,
+        "PE LTP": pe_ltp,
+        "PE ATP": pe_atp,
+        "PE LTP-ATP": pe_ltp - pe_atp,
+    })
+
+    ce_g = greeks_map_placeholder = None  # will fill after greeks_map built
+    # Greeks computed later from chain; placeholder replaced below
+
+    total = ce_ltp + pe_ltp
+    otm_share_rows.append({
+        "Role": role,
+        "Strike": strike,
+        "CE LTP": ce_ltp,
+        "PE LTP": pe_ltp,
+        "CE / (CE+PE) %": (ce_ltp / total * 100) if total > 0 else float("nan"),
+        "PE / (CE+PE) %": (pe_ltp / total * 100) if total > 0 else float("nan"),
+    })
+
+otm_dev_df = pd.DataFrame(otm_dev_rows)
+otm_share_df = pd.DataFrame(otm_share_rows)
+
+# Greeks map from full chain
 greeks_map = build_greeks_map(chain_rows)
 
-theta_rows = []
-for strike in dev_strikes:
-    ce_sym = option_map[strike].get("CE")
-    pe_sym = option_map[strike].get("PE")
+for strike in all_otm_strikes:
+    role = otm_role_map[strike]
+    ce_sym = option_map[strike]["CE"]
+    pe_sym = option_map[strike]["PE"]
 
-    ce_g = greeks_map.get(ce_sym, {}) if ce_sym else {}
-    pe_g = greeks_map.get(pe_sym, {}) if pe_sym else {}
+    ce_g = greeks_map.get(ce_sym, {})
+    pe_g = greeks_map.get(pe_sym, {})
 
     ce_theta = ce_g.get("theta")
     ce_delta = ce_g.get("delta")
     pe_theta = pe_g.get("theta")
     pe_delta = pe_g.get("delta")
 
-    theta_rows.append({
-        "Role": role_map[strike],
+    otm_theta_rows.append({
+        "Role": role,
         "Strike": strike,
         "CE Theta": ce_theta,
         "CE Delta": ce_delta,
         "CE |Θ| / |Δ|": theta_ratio(ce_theta, ce_delta),
         "PE Theta": pe_theta,
         "PE Delta": pe_delta,
-        "PE |Θ| / |Δ|": theta_ratio(pe_theta, pe_delta)
+        "PE |Θ| / |Δ|": theta_ratio(pe_theta, pe_delta),
     })
 
-theta_df = pd.DataFrame(theta_rows)
+otm_theta_df = pd.DataFrame(otm_theta_rows)
 
-avg_ce_theta_ratio = theta_df["CE |Θ| / |Δ|"].mean()
-avg_pe_theta_ratio = theta_df["PE |Θ| / |Δ|"].mean()
+# --- Step 8: OTM-based averages (CE over OTM CE, PE over OTM PE) ----------
+ce_dev_values = otm_dev_df.loc[otm_dev_df["Role"] == "OTM CE", "CE LTP-ATP"].tolist()
+pe_dev_values = otm_dev_df.loc[otm_dev_df["Role"] == "OTM PE", "PE LTP-ATP"].tolist()
+average_ce_deviation = float(sum(ce_dev_values) / len(ce_dev_values))
+average_pe_deviation = float(sum(pe_dev_values) / len(pe_dev_values))
 
-# --- CE / PE share at Syn ATM±1 -------------------------------------------
-share_df = calculation_df[["Strike", "CE LTP", "PE LTP"]].copy()
-share_total = share_df["CE LTP"] + share_df["PE LTP"]
+ce_theta_values = otm_theta_df.loc[otm_theta_df["Role"] == "OTM CE", "CE |Θ| / |Δ|"].dropna().tolist()
+pe_theta_values = otm_theta_df.loc[otm_theta_df["Role"] == "OTM PE", "PE |Θ| / |Δ|"].dropna().tolist()
+avg_ce_theta_ratio = float(sum(ce_theta_values) / len(ce_theta_values)) if ce_theta_values else float("nan")
+avg_pe_theta_ratio = float(sum(pe_theta_values) / len(pe_theta_values)) if pe_theta_values else float("nan")
 
-share_df["CE / (CE+PE) %"] = (
-    share_df["CE LTP"] / share_total.where(share_total > 0) * 100
+ce_share_values = otm_share_df.loc[otm_share_df["Role"] == "OTM CE", "CE / (CE+PE) %"].dropna().tolist()
+pe_share_values = otm_share_df.loc[otm_share_df["Role"] == "OTM PE", "PE / (CE+PE) %"].dropna().tolist()
+avg_ce_share = float(sum(ce_share_values) / len(ce_share_values)) if ce_share_values else float("nan")
+avg_pe_share = float(sum(pe_share_values) / len(pe_share_values)) if pe_share_values else float("nan")
+
+# --- Syn ATM-window synthetic future (display only) -----------------------
+syn_df_final, syn_fut_final = calculate_synthetic_future(
+    dev_strikes,
+    option_map,
+    quotes
 )
-share_df["PE / (CE+PE) %"] = (
-    share_df["PE LTP"] / share_total.where(share_total > 0) * 100
-)
-
-avg_ce_share = float(share_df["CE / (CE+PE) %"].mean())
-avg_pe_share = float(share_df["PE / (CE+PE) %"].mean())
 
 # ---------------------------------------------------------------------------
 # Display
@@ -674,7 +677,7 @@ st.caption(
     f"({len(strike_list)} strikes, step {int(strike_step)})"
 )
 
-# --- Metrics in a 3×N grid so all labels fit -------------------------------
+# --- Metrics in a 3-column grid -------------------------------------------
 row1 = st.columns(3)
 row1[0].metric("Spot", f"{spot:,.2f}")
 row1[1].metric("Syn Future", f"{syn_fut:,.2f}")
@@ -710,7 +713,17 @@ row5[0].metric(
     "n/a" if pd.isna(avg_pe_share) else f"{avg_pe_share:.1f}%"
 )
 
-# --- Synthetic Future — Syn ATM window -------------------------------------
+# --- OTM strike summary caption -------------------------------------------
+st.caption(
+    f"**OTM CE strikes** ({len(otm_ce_strikes)}) — above Syn ATM {int(atm):,} "
+    f"up to Upper BE strike {int(upper_strike):,}: "
+    f"{[int(s) for s in otm_ce_strikes]}  ·  "
+    f"**OTM PE strikes** ({len(otm_pe_strikes)}) — from Lower BE strike "
+    f"{int(lower_strike):,} up to (but not incl.) Syn ATM {int(atm):,}: "
+    f"{[int(s) for s in otm_pe_strikes]}"
+)
+
+# --- Synthetic Future — Syn ATM window ------------------------------------
 st.subheader(
     "Synthetic Future (Strike + CE LTP − PE LTP) — Syn ATM window"
 )
@@ -732,11 +745,12 @@ st.write(
 )
 
 st.caption(
-    "The breakevens below use the bootstrap average (from the spot ATM window). "
-    "The two averages only diverge meaningfully when the synthetic future sits "
-    "near the midpoint between two strikes."
+    "The breakevens use the bootstrap average (from the spot ATM window). "
+    "This table is kept for context; the OTM-based calculations below do not "
+    "use it."
 )
 
+# --- Breakeven Strike Selection -------------------------------------------
 st.subheader("Breakeven Strike Selection")
 
 be_df = pd.DataFrame([
@@ -756,12 +770,12 @@ be_df = pd.DataFrame([
 
 st.dataframe(be_df, use_container_width=True, hide_index=True)
 
-# --- CE / (CE+PE) at Syn ATM±1 ---------------------------------------------
+# --- CE / (CE+PE) at OTM strikes ------------------------------------------
 st.subheader(
-    "CE / (CE + PE) & PE / (CE + PE) at Syn ATM−1, Syn ATM, Syn ATM+1"
+    "CE / (CE + PE) & PE / (CE + PE) at OTM Strikes"
 )
 
-st.dataframe(share_df, use_container_width=True, hide_index=True)
+st.dataframe(otm_share_df, use_container_width=True, hide_index=True)
 
 sh = st.columns(2)
 sh[0].metric(
@@ -774,17 +788,18 @@ sh[1].metric(
 )
 
 st.caption(
-    "Share at each strike = CE LTP / (CE LTP + PE LTP) and "
-    "PE LTP / (CE LTP + PE LTP); the metrics are the simple average of the "
-    "three strikes."
+    f"Avg CE share = mean of CE/(CE+PE) over the {len(otm_ce_strikes)} OTM CE "
+    f"strikes. Avg PE share = mean of PE/(CE+PE) over the "
+    f"{len(otm_pe_strikes)} OTM PE strikes. Rows are marked OTM CE / OTM PE "
+    f"in the Role column."
 )
 
-# --- |Theta| / |Delta| at Syn ATM±1 ----------------------------------------
+# --- |Theta| / |Delta| at OTM strikes -------------------------------------
 st.subheader(
-    "|Theta| / |Delta| at Syn ATM−1, Syn ATM, Syn ATM+1"
+    "|Theta| / |Delta| at OTM Strikes"
 )
 
-st.dataframe(theta_df, use_container_width=True, hide_index=True)
+st.dataframe(otm_theta_df, use_container_width=True, hide_index=True)
 
 th = st.columns(2)
 th[0].metric(
@@ -797,95 +812,189 @@ th[1].metric(
 )
 
 st.caption(
-    "Ratio = abs(Theta) / abs(Delta). "
-    "Theta and Delta are from the same option chain snapshot. "
-    "Shown for both CE and PE at each of the three Syn ATM signal strikes. "
-    "The metrics are the simple average of the three strikes."
+    f"Avg CE |Θ|/|Δ| = mean over the {len(otm_ce_strikes)} OTM CE strikes. "
+    f"Avg PE |Θ|/|Δ| = mean over the {len(otm_pe_strikes)} OTM PE strikes. "
+    f"Ratio = abs(Theta) / abs(Delta) from the same chain snapshot."
 )
 
-# --- CE / PE LTP − ATP -----------------------------------------------------
-st.subheader("CE / PE LTP − ATP (Syn ATM−1, Syn ATM, Syn ATM+1)")
+# --- CE / PE LTP − ATP at OTM strikes -------------------------------------
+st.subheader("CE / PE LTP − ATP at OTM Strikes")
 
-display_df = calculation_df[
-    [
-        "Strike",
-        "CE ATP",
-        "CE LTP",
-        "CE LTP-ATP",
-        "PE LTP",
-        "PE ATP",
-        "PE LTP-ATP"
-    ]
-].copy()
-
-display_df.insert(0, "Role", display_df["Strike"].map(role_map))
-
-st.dataframe(display_df, use_container_width=True, hide_index=True)
+st.dataframe(otm_dev_df, use_container_width=True, hide_index=True)
 
 dv = st.columns(2)
 dv[0].metric("Avg CE LTP−ATP", f"{average_ce_deviation:+,.2f}")
 dv[1].metric("Avg PE LTP−ATP", f"{average_pe_deviation:+,.2f}")
 
 st.caption(
-    "Deviation = LTP − ATP. The metrics are the simple average of the three "
-    "strikes and are the same values shown as Avg CE Dev. / Avg PE Dev. in "
-    "the top metrics."
+    f"Avg CE LTP−ATP = mean over the {len(otm_ce_strikes)} OTM CE strikes. "
+    f"Avg PE LTP−ATP = mean over the {len(otm_pe_strikes)} OTM PE strikes. "
+    f"These are the same values shown as Avg CE Dev. / Avg PE Dev. in the "
+    f"top metrics."
 )
 
-# --- Calculation breakdown -------------------------------------------------
+# --- Calculation breakdown (OTM) ------------------------------------------
 st.subheader("Calculation")
 
-for _, row in calculation_df.iterrows():
+ce_dev_df = otm_dev_df[otm_dev_df["Role"] == "OTM CE"]
+pe_dev_df = otm_dev_df[otm_dev_df["Role"] == "OTM PE"]
+
+if not ce_dev_df.empty:
+    st.write("**OTM CE Strikes (CE LTP − CE ATP):**")
+    for _, row in ce_dev_df.iterrows():
+        st.write(
+            f"  {row['Strike']:,.0f}: "
+            f"{row['CE LTP']:,.2f} − {row['CE ATP']:,.2f} = "
+            f"**{row['CE LTP-ATP']:+,.2f}**"
+        )
+    ce_vals_text = " + ".join(
+        f"({x:+,.2f})" for x in ce_dev_df["CE LTP-ATP"].tolist()
+    )
     st.write(
-        f"**{row['Strike']:,.0f}** → "
-        f"CE: {row['CE LTP']:,.2f} − {row['CE ATP']:,.2f} = "
-        f"**{row['CE LTP-ATP']:+,.2f}** | "
-        f"PE: {row['PE LTP']:,.2f} − {row['PE ATP']:,.2f} = "
-        f"**{row['PE LTP-ATP']:+,.2f}**"
+        f"**Avg CE Dev:** ({ce_vals_text}) / {len(ce_dev_df)} = "
+        f"**{average_ce_deviation:+,.2f}**"
     )
 
-ce_values = calculation_df["CE LTP-ATP"].tolist()
-pe_values = calculation_df["PE LTP-ATP"].tolist()
-
-ce_values_text = " + ".join(f"({x:+,.2f})" for x in ce_values)
-pe_values_text = " + ".join(f"({x:+,.2f})" for x in pe_values)
-
-st.write(
-    f"**Average CE Dev:** ({ce_values_text}) / {len(ce_values)} = "
-    f"**{average_ce_deviation:+,.2f}**"
-)
-
-st.write(
-    f"**Average PE Dev:** ({pe_values_text}) / {len(pe_values)} = "
-    f"**{average_pe_deviation:+,.2f}**"
-)
-
-for _, row in share_df.iterrows():
+if not pe_dev_df.empty:
+    st.write("**OTM PE Strikes (PE LTP − PE ATP):**")
+    for _, row in pe_dev_df.iterrows():
+        st.write(
+            f"  {row['Strike']:,.0f}: "
+            f"{row['PE LTP']:,.2f} − {row['PE ATP']:,.2f} = "
+            f"**{row['PE LTP-ATP']:+,.2f}**"
+        )
+    pe_vals_text = " + ".join(
+        f"({x:+,.2f})" for x in pe_dev_df["PE LTP-ATP"].tolist()
+    )
     st.write(
-        f"**{row['Strike']:,.0f}** → "
-        f"CE: {row['CE LTP']:,.2f} / "
-        f"({row['CE LTP']:,.2f} + {row['PE LTP']:,.2f}) = "
-        f"**{row['CE / (CE+PE) %']:.1f}%** | "
-        f"PE: {row['PE LTP']:,.2f} / "
-        f"({row['CE LTP']:,.2f} + {row['PE LTP']:,.2f}) = "
-        f"**{row['PE / (CE+PE) %']:.1f}%**"
+        f"**Avg PE Dev:** ({pe_vals_text}) / {len(pe_dev_df)} = "
+        f"**{average_pe_deviation:+,.2f}**"
     )
 
-ce_share_text = " + ".join(
-    f"{x:.1f}%" for x in share_df["CE / (CE+PE) %"].tolist()
-)
-pe_share_text = " + ".join(
-    f"{x:.1f}%" for x in share_df["PE / (CE+PE) %"].tolist()
-)
+ce_share_df = otm_share_df[otm_share_df["Role"] == "OTM CE"]
+pe_share_df = otm_share_df[otm_share_df["Role"] == "OTM PE"]
 
-st.write(
-    f"**Avg CE / (CE + PE):** ({ce_share_text}) / {len(share_df)} = "
-    f"**{avg_ce_share:.1f}%**"
-)
+if not ce_share_df.empty:
+    st.write("**OTM CE Strikes (CE / (CE + PE)):**")
+    for _, row in ce_share_df.iterrows():
+        st.write(
+            f"  {row['Strike']:,.0f}: "
+            f"{row['CE LTP']:,.2f} / "
+            f"({row['CE LTP']:,.2f} + {row['PE LTP']:,.2f}) = "
+            f"**{row['CE / (CE+PE) %']:.1f}%**"
+        )
+    ce_share_text = " + ".join(
+        f"{x:.1f}%" for x in ce_share_df["CE / (CE+PE) %"].tolist()
+    )
+    st.write(
+        f"**Avg CE / (CE + PE):** ({ce_share_text}) / {len(ce_share_df)} = "
+        f"**{avg_ce_share:.1f}%**"
+    )
 
-st.write(
-    f"**Avg PE / (CE + PE):** ({pe_share_text}) / {len(share_df)} = "
-    f"**{avg_pe_share:.1f}%**"
-)
+if not pe_share_df.empty:
+    st.write("**OTM PE Strikes (PE / (CE + PE)):**")
+    for _, row in pe_share_df.iterrows():
+        st.write(
+            f"  {row['Strike']:,.0f}: "
+            f"{row['PE LTP']:,.2f} / "
+            f"({row['CE LTP']:,.2f} + {row['PE LTP']:,.2f}) = "
+            f"**{row['PE / (CE+PE) %']:.1f}%**"
+        )
+    pe_share_text = " + ".join(
+        f"{x:.1f}%" for x in pe_share_df["PE / (CE+PE) %"].tolist()
+    )
+    st.write(
+        f"**Avg PE / (CE + PE):** ({pe_share_text}) / {len(pe_share_df)} = "
+        f"**{avg_pe_share:.1f}%**"
+    )
+
+# --- Raw quotes -----------------------------------------------------------
+with st.expander("Raw Quotes API Data"):
+    raw_rows = []
+    for symbol in dict.fromkeys(trade_symbols):
+        quote = quotes.get(symbol, {})
+        raw_rows.append({
+            "Symbol": symbol,
+            "LTP": quote.get("lp"),
+            "ATP": quote.get("atp"),
+            "Bid": quote.get("bid"),
+            "Ask": quote.get("ask"),
+            "Volume": quote.get("volume")
+        })
+    st.dataframe(
+        pd.DataFrame(raw_rows),
+        use_container_width=True,
+        hide_index=True
+    )
+
+# --- Strategy formula -----------------------------------------------------
+with st.expander("Strategy Formula"):
+    st.latex(r"CE_{dev}=CE_{LTP}-CE_{ATP}")
+    st.latex(r"PE_{dev}=PE_{LTP}-PE_{ATP}")
+    st.latex(
+        r"OTM\ CE=\{K\in strikes : SynATM<K\leq UpperBE\ Strike\}"
+    )
+    st.latex(
+        r"OTM\ PE=\{K\in strikes : LowerBE\ Strike\leq K<SynATM\}"
+    )
+    st.latex(
+        r"AvgCEDev=\frac{1}{N_{CE}}"
+        r"\sum_{K\in OTM\ CE}(CE_{LTP,K}-CE_{ATP,K})"
+    )
+    st.latex(
+        r"AvgPEDev=\frac{1}{N_{PE}}"
+        r"\sum_{K\in OTM\ PE}(PE_{LTP,K}-PE_{ATP,K})"
+    )
+    st.latex(r"SynFut_{K}=K+CE_{LTP,K}-PE_{LTP,K}")
+    st.latex(
+        r"SynFut=\frac{SynFut_{SpotATM-1}+SynFut_{SpotATM}+SynFut_{SpotATM+1}}{3}"
+    )
+    st.latex(r"Syn\ ATM=\text{listed strike closest to }SynFut")
+    st.latex(r"Straddle=CE_{LTP,SynATM}+PE_{LTP,SynATM}")
+    st.latex(r"Upper\ BE=SynFut+Straddle")
+    st.latex(r"Lower\ BE=SynFut-Straddle")
+    st.latex(
+        r"CE\ Share_{K}=\frac{CE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
+        r",\quad "
+        r"PE\ Share_{K}=\frac{PE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
+    )
+    st.latex(
+        r"Avg\ CE\ Share=\frac{1}{N_{CE}}"
+        r"\sum_{K\in OTM\ CE}CE\ Share_{K}"
+    )
+    st.latex(
+        r"Avg\ PE\ Share=\frac{1}{N_{PE}}"
+        r"\sum_{K\in OTM\ PE}PE\ Share_{K}"
+    )
+    st.latex(r"Theta\ Ratio_{K}=\frac{|\Theta_{K}|}{|\Delta_{K}|}")
+    st.latex(
+        r"Avg\ CE\ Theta\ Ratio=\frac{1}{N_{CE}}"
+        r"\sum_{K\in OTM\ CE}"
+        r"\frac{|\Theta_{CE,K}|}{|\Delta_{CE,K}|}"
+    )
+    st.latex(
+        r"Avg\ PE\ Theta\ Ratio=\frac{1}{N_{PE}}"
+        r"\sum_{K\in OTM\ PE}"
+        r"\frac{|\Theta_{PE,K}|}{|\Delta_{PE,K}|}"
+    )
+
+    st.write(
+        "OTM CE strikes = all both-leg strikes strictly above the Syn ATM, "
+        "up to and including the Upper BE strike."
+    )
+    st.write(
+        "OTM PE strikes = all both-leg strikes strictly below the Syn ATM, "
+        "down to and including the Lower BE strike."
+    )
+    st.write(
+        "All three averages (Dev, |Θ|/|Δ|, CE/PE share) are computed over "
+        "these OTM windows — CE side over OTM CE strikes, PE side over OTM "
+        "PE strikes."
+    )
+    st.write(
+        "All values are informational signals only. No orders are sent to "
+        "Fyers."
+    )
+
 if st.button("Manual Refresh"):
     st.rerun()
