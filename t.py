@@ -1038,15 +1038,25 @@ st.caption(
 
 m = st.columns(9)
 
+# m[0].metric("Spot", f"{spot:,.2f}")
+# m[1].metric("Syn Future", f"{syn_fut:,.2f}")
+# m[2].metric("Syn Fut @ Syn ATM", f"{syn_fut_final:,.2f}")
+# m[3].metric("Syn ATM", f"{atm:,.0f}")
+# m[4].metric("Straddle @ Syn ATM", f"{atm_straddle:,.2f}")
+# m[5].metric("Upper BE Strike", f"{upper_strike:,.2f}")
+# m[6].metric("Lower BE Strike", f"{lower_strike:,.2f}")
+# m[7].metric("Avg CE Dev.", f"{average_ce_deviation:+,.2f}")
+# m[8].metric("Avg PE Dev.", f"{average_pe_deviation:+,.2f}")
+
 m[0].metric("Spot", f"{spot:,.2f}")
 m[1].metric("Syn Future", f"{syn_fut:,.2f}")
-m[2].metric("Syn Fut @ Syn ATM", f"{syn_fut_final:,.2f}")
-m[3].metric("Syn ATM", f"{atm:,.0f}")
-m[4].metric("Straddle @ Syn ATM", f"{atm_straddle:,.2f}")
-m[5].metric("Upper BE Strike", f"{upper_strike:,.2f}")
-m[6].metric("Lower BE Strike", f"{lower_strike:,.2f}")
-m[7].metric("Avg CE Dev.", f"{average_ce_deviation:+,.2f}")
-m[8].metric("Avg PE Dev.", f"{average_pe_deviation:+,.2f}")
+# m[2].metric("Syn Fut @ Syn ATM", f"{syn_fut_final:,.2f}")
+m[2].metric("Syn ATM", f"{atm:,.0f}")
+m[3].metric("Straddle @ Syn ATM", f"{atm_straddle:,.2f}")
+m[4].metric("Upper BE Strike", f"{upper_strike:,.2f}")
+m[5].metric("Lower BE Strike", f"{lower_strike:,.2f}")
+m[6].metric("Avg CE Dev.", f"{average_ce_deviation:+,.2f}")
+m[7].metric("Avg PE Dev.", f"{average_pe_deviation:+,.2f}")
 
 # ---------------------------------------------------------------------------
 # Synthetic Future — bootstrap (Spot ATM) window
