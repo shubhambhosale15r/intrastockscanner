@@ -210,23 +210,86 @@ def select_three_around(option_map, center_strike):
         )
     return window, None
 
-def find_breakeven_strikes(option_map, center, straddle):
+def find_breakeven_and_otm_windows(option_map, syn_fut, straddle):
+    """Compute breakevens and matched OTM CE/PE windows.
+
+    Both the CE and PE windows are extended outward (never trimmed) so that
+    they contain exactly the same number of strikes. The final 'upper_strike'
+    and 'lower_strike' are the extended boundaries — used for the OTM
+    calculations and shown in the metrics."""
     strikes = both_leg_strikes(option_map)
     if not strikes:
-        raise RuntimeError("No strikes available for breakeven calculation.")
-    upper_breakeven = center + straddle
-    lower_breakeven = center - straddle
-    upper_strike = min(strikes, key=lambda s: abs(s - upper_breakeven))
-    lower_strike = min(strikes, key=lambda s: abs(s - lower_breakeven))
-    if "CE" not in option_map[upper_strike]:
+        raise RuntimeError("No strikes with both CE and PE available.")
+
+    upper_breakeven = syn_fut + straddle
+    lower_breakeven = syn_fut - straddle
+
+    atm = min(strikes, key=lambda s: abs(s - syn_fut))
+    atm_idx = strikes.index(atm)
+
+    above = [s for s in strikes if s > atm]
+    below = [s for s in strikes if s < atm]
+
+    if not above:
         raise RuntimeError(
-            f"CE unavailable at upper breakeven strike {upper_strike}."
+            f"No both-leg strikes above Syn ATM {atm:,.0f}. "
+            f"Increase Strike Count."
         )
-    if "PE" not in option_map[lower_strike]:
+    if not below:
         raise RuntimeError(
-            f"PE unavailable at lower breakeven strike {lower_strike}."
+            f"No both-leg strikes below Syn ATM {atm:,.0f}. "
+            f"Increase Strike Count."
         )
-    return upper_breakeven, lower_breakeven, upper_strike, lower_strike
+
+    upper_strike_init = min(above, key=lambda s: abs(s - upper_breakeven))
+    lower_strike_init = min(below, key=lambda s: abs(s - lower_breakeven))
+
+    upper_idx = strikes.index(upper_strike_init)
+    lower_idx = strikes.index(lower_strike_init)
+
+    ce_count_init = upper_idx - atm_idx
+    pe_count_init = atm_idx - lower_idx
+
+    n_target = max(ce_count_init, pe_count_init)
+
+    new_upper_idx = atm_idx + n_target
+    new_lower_idx = atm_idx - n_target
+
+    if new_upper_idx >= len(strikes):
+        raise RuntimeError(
+            f"Need {n_target} OTM CE strikes per side, but only "
+            f"{len(strikes) - atm_idx - 1} are loaded above Syn ATM "
+            f"{atm:,.0f}. Increase Strike Count."
+        )
+    if new_lower_idx < 0:
+        raise RuntimeError(
+            f"Need {n_target} OTM PE strikes per side, but only "
+            f"{atm_idx} are loaded below Syn ATM {atm:,.0f}. "
+            f"Increase Strike Count."
+        )
+
+    upper_strike = strikes[new_upper_idx]
+    lower_strike = strikes[new_lower_idx]
+
+    otm_ce = strikes[atm_idx + 1 : new_upper_idx + 1]
+    otm_pe = strikes[new_lower_idx : atm_idx]
+
+    return {
+        "upper_breakeven": upper_breakeven,
+        "lower_breakeven": lower_breakeven,
+        "atm": atm,
+        "upper_strike_init": upper_strike_init,
+        "lower_strike_init": lower_strike_init,
+        "upper_strike": upper_strike,
+        "lower_strike": lower_strike,
+        "otm_ce_strikes": otm_ce,
+        "otm_pe_strikes": otm_pe,
+        "n_target": n_target,
+        "ce_count_init": ce_count_init,
+        "pe_count_init": pe_count_init,
+        "ce_extended": upper_strike != upper_strike_init,
+        "pe_extended": lower_strike != lower_strike_init,
+    }
 
 def valid_number(value):
     if value is None:
@@ -461,75 +524,30 @@ atm_ce_ltp = float(atm_ce_ltp)
 atm_pe_ltp = float(atm_pe_ltp)
 atm_straddle = atm_ce_ltp + atm_pe_ltp
 
-# --- Step 4: breakevens = synthetic future +/- straddle --------------------
+# --- Step 4: breakevens + matched OTM windows (single call) ---------------
 try:
-    (
-        upper_breakeven,
-        lower_breakeven,
-        upper_strike,
-        lower_strike
-    ) = find_breakeven_strikes(option_map, syn_fut, atm_straddle)
+    be_info = find_breakeven_and_otm_windows(
+        option_map, syn_fut, atm_straddle
+    )
 except Exception as e:
     st.error(str(e))
     st.stop()
 
-if abs(upper_strike - upper_breakeven) > strike_step:
-    window_warnings.append(
-        f"Upper breakeven {upper_breakeven:,.0f} is outside the loaded chain "
-        f"(nearest listed strike {upper_strike:,.0f}). Increase Strike Count."
-    )
-
-if abs(lower_strike - lower_breakeven) > strike_step:
-    window_warnings.append(
-        f"Lower breakeven {lower_breakeven:,.0f} is outside the loaded chain "
-        f"(nearest listed strike {lower_strike:,.0f}). Increase Strike Count."
-    )
-
-# --- Step 5: raw OTM CE and OTM PE windows --------------------------------
-all_loaded_strikes = both_leg_strikes(option_map)
-
-otm_ce_strikes_raw = [
-    s for s in all_loaded_strikes if atm < s <= upper_strike
-]
-otm_pe_strikes_raw = [
-    s for s in all_loaded_strikes if lower_strike <= s < atm
-]
-
-if not otm_ce_strikes_raw:
-    st.error(
-        f"No OTM CE strikes between Syn ATM ({atm:,.0f}) and Upper BE strike "
-        f"({upper_strike:,.0f}). Increase Strike Count or check the chain."
-    )
-    st.stop()
-
-if not otm_pe_strikes_raw:
-    st.error(
-        f"No OTM PE strikes between Lower BE strike ({lower_strike:,.0f}) and "
-        f"Syn ATM ({atm:,.0f}). Increase Strike Count or check the chain."
-    )
-    st.stop()
-
-# --- Step 5.5: match counts — min(N_CE, N_PE) strikes on each side --------
-n_ce_raw = len(otm_ce_strikes_raw)
-n_pe_raw = len(otm_pe_strikes_raw)
-n_common = min(n_ce_raw, n_pe_raw)
-
-# otm_ce_strikes_raw is ascending; innermost = first N (smallest = closest to ATM)
-otm_ce_strikes = sorted(otm_ce_strikes_raw)[:n_common]
-
-# otm_pe_strikes_raw is ascending; innermost = last N (largest = closest to ATM)
-otm_pe_strikes = sorted(otm_pe_strikes_raw, reverse=True)[:n_common]
-otm_pe_strikes = sorted(otm_pe_strikes)  # re-sort ascending for display
-
-dropped_ce = [s for s in otm_ce_strikes_raw if s not in otm_ce_strikes]
-dropped_pe = [s for s in otm_pe_strikes_raw if s not in otm_pe_strikes]
+upper_breakeven = be_info["upper_breakeven"]
+lower_breakeven = be_info["lower_breakeven"]
+upper_strike = be_info["upper_strike"]
+lower_strike = be_info["lower_strike"]
+upper_strike_init = be_info["upper_strike_init"]
+lower_strike_init = be_info["lower_strike_init"]
+otm_ce_strikes = be_info["otm_ce_strikes"]
+otm_pe_strikes = be_info["otm_pe_strikes"]
+n_target = be_info["n_target"]
 
 otm_role_map = {s: "OTM CE" for s in otm_ce_strikes}
 otm_role_map.update({s: "OTM PE" for s in otm_pe_strikes})
-
 all_otm_strikes = sorted(otm_ce_strikes + otm_pe_strikes)
 
-# --- Step 6: fetch quotes for all (trimmed) OTM strikes -------------------
+# --- Step 5: fetch quotes for all OTM strikes ----------------------------
 otm_symbols = []
 for strike in all_otm_strikes:
     otm_symbols.append(option_map[strike]["CE"])
@@ -548,7 +566,7 @@ if missing_otm_symbols:
         st.error(f"OTM strike quotes fetch failed: {e}")
         st.stop()
 
-# --- Step 7: OTM-based deviations + share --------------------------------
+# --- Step 6: OTM-based deviations + share --------------------------------
 otm_dev_rows = []
 otm_share_rows = []
 
@@ -630,7 +648,7 @@ for strike in all_otm_strikes:
 
 otm_theta_df = pd.DataFrame(otm_theta_rows)
 
-# --- Step 8: OTM-based averages (CE over OTM CE, PE over OTM PE) ----------
+# --- Step 7: OTM-based averages (CE over OTM CE, PE over OTM PE) ---------
 ce_dev_values = otm_dev_df.loc[
     otm_dev_df["Role"] == "OTM CE", "CE LTP-ATP"
 ].tolist()
@@ -670,7 +688,7 @@ avg_pe_share = (
     if pe_share_values else float("nan")
 )
 
-# --- Syn ATM-window synthetic future (display only) -----------------------
+# --- Syn ATM-window synthetic future (display only) ----------------------
 syn_df_final, syn_fut_final = calculate_synthetic_future(
     dev_strikes,
     option_map,
@@ -700,27 +718,26 @@ st.caption(
     f"({len(strike_list)} strikes, step {int(strike_step)})"
 )
 
-# --- Truncation info box ---------------------------------------------------
-if dropped_ce or dropped_pe:
-    dropped_bits = []
-    if dropped_ce:
-        dropped_bits.append(
-            f"dropped OTM CE strike(s) {[int(s) for s in dropped_ce]} "
-            f"(outermost, nearest Upper BE strike)"
-        )
-    if dropped_pe:
-        dropped_bits.append(
-            f"dropped OTM PE strike(s) {[int(s) for s in dropped_pe]} "
-            f"(outermost, nearest Lower BE strike)"
-        )
-    st.info(
-        f"OTM strike counts matched to **N = {n_common} per side** "
-        f"(raw: {n_ce_raw} OTM CE / {n_pe_raw} OTM PE). Kept the innermost "
-        f"N strikes on each side (closest to Syn ATM {int(atm):,}). "
-        f"{' · '.join(dropped_bits)}."
+# --- Extension info box ---------------------------------------------------
+extension_msgs = []
+if be_info["ce_extended"]:
+    extension_msgs.append(
+        f"**OTM CE side extended** — closest strike to Upper BE "
+        f"({upper_breakeven:,.2f}) was {upper_strike_init:,.0f} "
+        f"({be_info['ce_count_init']} strikes), extended to "
+        f"{upper_strike:,.0f} ({n_target} strikes) so CE count matches PE."
     )
+if be_info["pe_extended"]:
+    extension_msgs.append(
+        f"**OTM PE side extended** — closest strike to Lower BE "
+        f"({lower_breakeven:,.2f}) was {lower_strike_init:,.0f} "
+        f"({be_info['pe_count_init']} strikes), extended to "
+        f"{lower_strike:,.0f} ({n_target} strikes) so PE count matches CE."
+    )
+for msg in extension_msgs:
+    st.info(msg)
 
-# --- Metrics --------------------------------------------------------------
+# --- Metrics -------------------------------------------------------------
 row1 = st.columns(3)
 row1[0].metric("Spot", f"{spot:,.2f}")
 row1[1].metric("Syn Future", f"{syn_fut:,.2f}")
@@ -755,9 +772,9 @@ row5[0].metric(
     "Avg PE / (CE + PE)",
     "n/a" if pd.isna(avg_pe_share) else f"{avg_pe_share:.1f}%"
 )
-row5[1].metric("OTM Strikes / Side", str(n_common))
+row5[1].metric("OTM Strikes / Side", str(n_target))
 
-# --- OTM window summary ---------------------------------------------------
+# --- OTM window summary --------------------------------------------------
 st.caption(
     f"**OTM CE** ({len(otm_ce_strikes)}): "
     f"{[int(s) for s in otm_ce_strikes]}  ·  "
@@ -765,7 +782,7 @@ st.caption(
     f"{[int(s) for s in otm_pe_strikes]}"
 )
 
-# --- Synthetic Future — Syn ATM window ------------------------------------
+# --- Synthetic Future — Syn ATM window -----------------------------------
 st.subheader(
     "Synthetic Future (Strike + CE LTP − PE LTP) — Syn ATM window"
 )
@@ -792,7 +809,7 @@ st.caption(
     "use it."
 )
 
-# --- Breakeven Strike Selection -------------------------------------------
+# --- Breakeven Strike Selection ------------------------------------------
 st.subheader("Breakeven Strike Selection")
 
 be_df = pd.DataFrame([
@@ -804,15 +821,25 @@ be_df = pd.DataFrame([
         "Syn ATM PE LTP": atm_pe_ltp,
         "Straddle": atm_straddle,
         "Upper Breakeven": upper_breakeven,
-        "Upper BE Strike": upper_strike,
+        "Upper BE Strike (closest)": upper_strike_init,
+        "Upper BE Strike (effective)": upper_strike,
         "Lower Breakeven": lower_breakeven,
-        "Lower BE Strike": lower_strike
+        "Lower BE Strike (closest)": lower_strike_init,
+        "Lower BE Strike (effective)": lower_strike,
+        "OTM Strikes per Side": n_target,
     }
 ])
 
 st.dataframe(be_df, use_container_width=True, hide_index=True)
 
-# --- CE / (CE+PE) at OTM strikes ------------------------------------------
+st.caption(
+    "The **effective** BE strikes are what all OTM-based calculations below "
+    "use. When the closest strikes yield different OTM counts on each side, "
+    "the shorter side is extended outward (never trimmed) until the counts "
+    "match."
+)
+
+# --- CE / (CE+PE) at OTM strikes -----------------------------------------
 st.subheader(
     "CE / (CE + PE) & PE / (CE + PE) at OTM Strikes"
 )
@@ -833,10 +860,10 @@ st.caption(
     f"Avg CE share = mean of CE/(CE+PE) over the **{len(otm_ce_strikes)}** "
     f"OTM CE strikes. Avg PE share = mean of PE/(CE+PE) over the "
     f"**{len(otm_pe_strikes)}** OTM PE strikes (counts matched to N="
-    f"{n_common}). Rows are marked OTM CE / OTM PE in the Role column."
+    f"{n_target}). Rows are marked OTM CE / OTM PE in the Role column."
 )
 
-# --- |Theta| / |Delta| at OTM strikes -------------------------------------
+# --- |Theta| / |Delta| at OTM strikes ------------------------------------
 st.subheader("|Theta| / |Delta| at OTM Strikes")
 
 st.dataframe(otm_theta_df, use_container_width=True, hide_index=True)
@@ -857,7 +884,7 @@ st.caption(
     f"Ratio = abs(Theta) / abs(Delta) from the same chain snapshot."
 )
 
-# --- CE / PE LTP − ATP at OTM strikes -------------------------------------
+# --- CE / PE LTP − ATP at OTM strikes ------------------------------------
 st.subheader("CE / PE LTP − ATP at OTM Strikes")
 
 st.dataframe(otm_dev_df, use_container_width=True, hide_index=True)
@@ -873,7 +900,7 @@ st.caption(
     f"top metrics."
 )
 
-# --- Calculation breakdown ------------------------------------------------
+# --- Calculation breakdown -----------------------------------------------
 st.subheader("Calculation")
 
 ce_dev_df = otm_dev_df[otm_dev_df["Role"] == "OTM CE"]
@@ -948,7 +975,7 @@ if not pe_share_df.empty:
         f"**{avg_pe_share:.1f}%**"
     )
 
-# --- Raw quotes ----------------------------------------------------------
+# --- Raw quotes ---------------------------------------------------------
 with st.expander("Raw Quotes API Data"):
     raw_rows = []
     for symbol in dict.fromkeys(trade_symbols):
@@ -967,26 +994,27 @@ with st.expander("Raw Quotes API Data"):
         hide_index=True
     )
 
-# --- Strategy formula ----------------------------------------------------
+# --- Strategy formula ---------------------------------------------------
 with st.expander("Strategy Formula"):
     st.latex(r"CE_{dev}=CE_{LTP}-CE_{ATP}")
     st.latex(r"PE_{dev}=PE_{LTP}-PE_{ATP}")
     st.latex(
-        r"OTM\ CE^{raw}=\{K: SynATM<K\leq UpperBE\ Strike\}"
+        r"Upper\ BE=SynFut+Straddle,\quad Lower\ BE=SynFut-Straddle"
     )
     st.latex(
-        r"OTM\ PE^{raw}=\{K: LowerBE\ Strike\leq K<SynATM\}"
+        r"N_{CE}^{init}=\#\{K: SynATM<K\leq\text{closest strike to }Upper\ BE\}"
     )
     st.latex(
-        r"N=\min(N_{CE}^{raw},\ N_{PE}^{raw})"
+        r"N_{PE}^{init}=\#\{K: \text{closest strike to }Lower\ BE\leq K<SynATM\}"
     )
     st.latex(
-        r"OTM\ CE = \text{innermost }N\text{ strikes of }OTM\ CE^{raw}"
-        r"\quad(\text{closest to }SynATM)"
+        r"N=\max(N_{CE}^{init},\ N_{PE}^{init})"
     )
     st.latex(
-        r"OTM\ PE = \text{innermost }N\text{ strikes of }OTM\ PE^{raw}"
-        r"\quad(\text{closest to }SynATM)"
+        r"OTM\ CE=\{K: SynATM<K\leq SynATM+N\cdot step\}"
+    )
+    st.latex(
+        r"OTM\ PE=\{K: SynATM-N\cdot step\leq K<SynATM\}"
     )
     st.latex(
         r"AvgCEDev=\frac{1}{N}\sum_{K\in OTM\ CE}(CE_{LTP,K}-CE_{ATP,K})"
@@ -1000,8 +1028,6 @@ with st.expander("Strategy Formula"):
     )
     st.latex(r"Syn\ ATM=\text{listed strike closest to }SynFut")
     st.latex(r"Straddle=CE_{LTP,SynATM}+PE_{LTP,SynATM}")
-    st.latex(r"Upper\ BE=SynFut+Straddle")
-    st.latex(r"Lower\ BE=SynFut-Straddle")
     st.latex(
         r"CE\ Share_{K}=\frac{CE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
         r",\quad "
@@ -1025,17 +1051,18 @@ with st.expander("Strategy Formula"):
 
     st.write(
         "OTM CE strikes = all both-leg strikes strictly above the Syn ATM, "
-        "up to and including the Upper BE strike."
+        "up to and including the effective Upper BE strike."
     )
     st.write(
         "OTM PE strikes = all both-leg strikes strictly below the Syn ATM, "
-        "down to and including the Lower BE strike."
+        "down to and including the effective Lower BE strike."
     )
     st.write(
-        "**Count matching:** N = min(N_CE, N_PE). The longer side is "
-        "trimmed to its innermost N strikes (the ones closest to the Syn "
-        "ATM), so both sides contribute the same number of data points to "
-        "every average."
+        "**Count matching:** start from the closest strike to each breakeven. "
+        "If that gives different counts, **extend the shorter side outward** "
+        "until both sides have N strikes. Never trim — always prefer more "
+        "strikes. The effective BE strikes shown in the metrics are the "
+        "extended boundaries."
     )
     st.write(
         "All values are informational signals only. No orders are sent to "
