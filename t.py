@@ -625,6 +625,9 @@ for strike in dev_strikes:
 
 theta_df = pd.DataFrame(theta_rows)
 
+avg_ce_theta_ratio = theta_df["CE |Θ| / |Δ|"].mean()
+avg_pe_theta_ratio = theta_df["PE |Θ| / |Δ|"].mean()
+
 # --- CE / PE share at Syn ATM±1 -------------------------------------------
 share_df = calculation_df[["Strike", "CE LTP", "PE LTP"]].copy()
 share_total = share_df["CE LTP"] + share_df["PE LTP"]
@@ -666,7 +669,7 @@ st.caption(
     f"({len(strike_list)} strikes, step {int(strike_step)})"
 )
 
-# --- Metrics in a 3×3 grid so all labels fit -------------------------------
+# --- Metrics in a 3×N grid so all labels fit -------------------------------
 row1 = st.columns(3)
 row1[0].metric("Spot", f"{spot:,.2f}")
 row1[1].metric("Syn Future", f"{syn_fut:,.2f}")
@@ -681,6 +684,26 @@ row3 = st.columns(3)
 row3[0].metric("Lower BE Strike", f"{lower_strike:,.2f}")
 row3[1].metric("Avg CE Dev.", f"{average_ce_deviation:+,.2f}")
 row3[2].metric("Avg PE Dev.", f"{average_pe_deviation:+,.2f}")
+
+row4 = st.columns(3)
+row4[0].metric(
+    "Avg CE |Θ| / |Δ|",
+    "n/a" if pd.isna(avg_ce_theta_ratio) else f"{avg_ce_theta_ratio:.4f}"
+)
+row4[1].metric(
+    "Avg PE |Θ| / |Δ|",
+    "n/a" if pd.isna(avg_pe_theta_ratio) else f"{avg_pe_theta_ratio:.4f}"
+)
+row4[2].metric(
+    "Avg CE / (CE + PE)",
+    "n/a" if pd.isna(avg_ce_share) else f"{avg_ce_share:.1f}%"
+)
+
+row5 = st.columns(3)
+row5[0].metric(
+    "Avg PE / (CE + PE)",
+    "n/a" if pd.isna(avg_pe_share) else f"{avg_pe_share:.1f}%"
+)
 
 # --- Synthetic Future — Syn ATM window --------------------------------------
 st.subheader(
@@ -756,10 +779,21 @@ st.subheader(
 
 st.dataframe(theta_df, use_container_width=True, hide_index=True)
 
+th = st.columns(2)
+th[0].metric(
+    "Avg CE |Θ| / |Δ|",
+    "n/a" if pd.isna(avg_ce_theta_ratio) else f"{avg_ce_theta_ratio:.4f}"
+)
+th[1].metric(
+    "Avg PE |Θ| / |Δ|",
+    "n/a" if pd.isna(avg_pe_theta_ratio) else f"{avg_pe_theta_ratio:.4f}"
+)
+
 st.caption(
     "Ratio = abs(Theta) / abs(Delta). "
     "Theta and Delta are from the same option chain snapshot. "
-    "Shown for both CE and PE at each of the three Syn ATM signal strikes."
+    "Shown for both CE and PE at each of the three Syn ATM signal strikes. "
+    "The metrics are the simple average of the three strikes."
 )
 
 # --- CE / PE LTP − ATP -----------------------------------------------------
@@ -780,6 +814,16 @@ display_df = calculation_df[
 display_df.insert(0, "Role", display_df["Strike"].map(role_map))
 
 st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+dv = st.columns(2)
+dv[0].metric("Avg CE LTP−ATP", f"{average_ce_deviation:+,.2f}")
+dv[1].metric("Avg PE LTP−ATP", f"{average_pe_deviation:+,.2f}")
+
+st.caption(
+    "Deviation = LTP − ATP. The metrics are the simple average of the three "
+    "strikes and are the same values shown as Avg CE Dev. / Avg PE Dev. in "
+    "the top metrics."
+)
 
 # --- Calculation breakdown -------------------------------------------------
 st.subheader("Calculation")
@@ -882,7 +926,25 @@ with st.expander("Strategy Formula"):
         r",\quad "
         r"PE\ Share_{K}=\frac{PE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
     )
+    st.latex(
+        r"Avg\ CE\ Share="
+        r"\frac{CEShare_{SynATM-1}+CEShare_{SynATM}+CEShare_{SynATM+1}}{3}"
+    )
+    st.latex(
+        r"Avg\ PE\ Share="
+        r"\frac{PEShare_{SynATM-1}+PEShare_{SynATM}+PEShare_{SynATM+1}}{3}"
+    )
     st.latex(r"Theta\ Ratio=\frac{|\Theta|}{|\Delta|}")
+    st.latex(
+        r"Avg\ CE\ Theta\ Ratio="
+        r"\frac{1}{3}\sum_{K\in\{SynATM-1,SynATM,SynATM+1\}}"
+        r"\frac{|\Theta_{CE,K}|}{|\Delta_{CE,K}|}"
+    )
+    st.latex(
+        r"Avg\ PE\ Theta\ Ratio="
+        r"\frac{1}{3}\sum_{K\in\{SynATM-1,SynATM,SynATM+1\}}"
+        r"\frac{|\Theta_{PE,K}|}{|\Delta_{PE,K}|}"
+    )
 
     st.write(
         "Buy signal: Avg CE Dev > 0, Avg PE Dev < 0, "
