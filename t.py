@@ -274,8 +274,9 @@ def valid_number(value):
     except (TypeError, ValueError):
         return False
 
-def theta_ratio(theta, ltp, delta):
-    if not all(valid_number(x) for x in (theta, ltp, delta)):
+def theta_ratio(theta, delta):
+    """|Theta| / |Delta|."""
+    if not all(valid_number(x) for x in (theta, delta)):
         return None
 
     denominator = abs(float(delta))
@@ -365,25 +366,6 @@ def install_autorefresh(enabled, refresh_seconds):
     st_autorefresh(
         interval=ms_until_next_boundary(refresh_seconds),
         key="nifty_atp_refresh"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Signal logic
-# ---------------------------------------------------------------------------
-
-def check_buy_signal(avg_ce_dev, avg_pe_dev):
-    return (
-        avg_ce_dev > 0
-        and avg_pe_dev < 0
-        and abs(avg_pe_dev) > 1.5 * abs(avg_ce_dev)
-    )
-
-def check_sell_signal(avg_ce_dev, avg_pe_dev):
-    return (
-        avg_pe_dev > 0
-        and avg_ce_dev < 0
-        and abs(avg_ce_dev) > 1.5 * abs(avg_pe_dev)
     )
 
 
@@ -614,28 +596,32 @@ syn_df_final, syn_fut_final = calculate_synthetic_future(
     quotes
 )
 
-# --- Theta / (LTP × Delta) at Syn ATM−1, Syn ATM, Syn ATM+1 ---------------
+# --- |Theta| / |Delta| at Syn ATM−1, Syn ATM, Syn ATM+1 -------------------
 greeks_map = build_greeks_map(chain_rows)
 
 theta_rows = []
 for strike in dev_strikes:
-    for opt in ("CE", "PE"):
-        sym = option_map[strike].get(opt)
-        if not sym:
-            continue
-        g = greeks_map.get(sym, {})
-        g_ltp = g.get("ltp")
-        g_delta = g.get("delta")
-        g_theta = g.get("theta")
-        theta_rows.append({
-            "Role": role_map[strike],
-            "Strike": strike,
-            "Type": opt,
-            "LTP (chain)": g_ltp,
-            "Delta": g_delta,
-            "Theta": g_theta,
-            "|Theta| / (LTP × |Delta|)": theta_ratio(g_theta, g_ltp, g_delta)
-        })
+    ce_sym = option_map[strike].get("CE")
+    pe_sym = option_map[strike].get("PE")
+
+    ce_g = greeks_map.get(ce_sym, {}) if ce_sym else {}
+    pe_g = greeks_map.get(pe_sym, {}) if pe_sym else {}
+
+    ce_theta = ce_g.get("theta")
+    ce_delta = ce_g.get("delta")
+    pe_theta = pe_g.get("theta")
+    pe_delta = pe_g.get("delta")
+
+    theta_rows.append({
+        "Role": role_map[strike],
+        "Strike": strike,
+        "CE Theta": ce_theta,
+        "CE Delta": ce_delta,
+        "CE |Θ| / |Δ|": theta_ratio(ce_theta, ce_delta),
+        "PE Theta": pe_theta,
+        "PE Delta": pe_delta,
+        "PE |Θ| / |Δ|": theta_ratio(pe_theta, pe_delta)
+    })
 
 theta_df = pd.DataFrame(theta_rows)
 
@@ -652,10 +638,6 @@ share_df["PE / (CE+PE) %"] = (
 
 avg_ce_share = float(share_df["CE / (CE+PE) %"].mean())
 avg_pe_share = float(share_df["PE / (CE+PE) %"].mean())
-
-# --- Signals --------------------------------------------------------------
-buy_signal = check_buy_signal(average_ce_deviation, average_pe_deviation)
-sell_signal = check_sell_signal(average_ce_deviation, average_pe_deviation)
 
 # ---------------------------------------------------------------------------
 # Display
@@ -763,18 +745,17 @@ st.caption(
     "three strikes."
 )
 
-# --- Theta / (LTP × Delta) at Syn ATM±1 -----------------------------------
+# --- |Theta| / |Delta| at Syn ATM±1 ----------------------------------------
 st.subheader(
-    "Theta / (LTP × Delta) at Syn ATM−1, Syn ATM, Syn ATM+1"
+    "|Theta| / |Delta| at Syn ATM−1, Syn ATM, Syn ATM+1"
 )
 
 st.dataframe(theta_df, use_container_width=True, hide_index=True)
 
 st.caption(
-    "Ratio = abs(Theta) / (LTP × abs(Delta)). "
-    "LTP, Delta and Theta are all from the same option chain snapshot. "
-    "Values are shown for both CE and PE at each of the three Syn ATM "
-    "signal strikes."
+    "Ratio = abs(Theta) / abs(Delta). "
+    "Theta and Delta are from the same option chain snapshot. "
+    "Shown for both CE and PE at each of the three Syn ATM signal strikes."
 )
 
 # --- CE / PE LTP − ATP -----------------------------------------------------
@@ -795,22 +776,6 @@ display_df = calculation_df[
 display_df.insert(0, "Role", display_df["Strike"].map(role_map))
 
 st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-# --- Signal Conditions -----------------------------------------------------
-st.subheader("Signal Conditions")
-
-signal_df = pd.DataFrame([
-    {
-        "Condition": "Buy Signal → SELL PE at Lower BE strike",
-        "Result": buy_signal
-    },
-    {
-        "Condition": "Sell Signal → SELL CE at Upper BE strike",
-        "Result": sell_signal
-    }
-])
-
-st.dataframe(signal_df, use_container_width=True, hide_index=True)
 
 # --- Calculation breakdown -------------------------------------------------
 st.subheader("Calculation")
@@ -913,7 +878,7 @@ with st.expander("Strategy Formula"):
         r",\quad "
         r"PE\ Share_{K}=\frac{PE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
     )
-    st.latex(r"Theta\ Ratio=\frac{|\Theta|}{LTP\times|\Delta|}")
+    st.latex(r"Theta\ Ratio=\frac{|\Theta|}{|\Delta|}")
 
     st.write(
         "Buy signal: Avg CE Dev > 0, Avg PE Dev < 0, "
