@@ -8,7 +8,7 @@ from fyers_apiv3 import fyersModel
 from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(
-    page_title="NIFTY CE/PE ATP Paper Trade",
+    page_title="NIFTY CE/PE ATP Signal",
     layout="wide"
 )
 
@@ -40,12 +40,10 @@ def fetch_spot(fyers, symbol):
         raise RuntimeError(f"Spot quote failed: {response}")
 
     data = response.get("d", [])
-
     if not data:
         raise RuntimeError(f"Spot quote returned no data: {response}")
 
     item = data[0]
-
     if item.get("s") != "ok":
         raise RuntimeError(f"Spot quote failed: {item}")
 
@@ -59,32 +57,25 @@ def fetch_spot(fyers, symbol):
 
 def fetch_option_quotes(fyers, symbols):
     symbols = tuple(dict.fromkeys(symbols))
-
     if not symbols:
         return {}
 
     if len(symbols) > 50:
         raise ValueError("Quotes API accepts a maximum of 50 symbols per request.")
 
-    response = fyers.quotes({
-        "symbols": ",".join(symbols)
-    })
+    response = fyers.quotes({"symbols": ",".join(symbols)})
 
     if response.get("s") != "ok":
         raise RuntimeError(f"Option quotes failed: {response}")
 
     quotes = {}
-
     for item in response.get("d", []):
         if item.get("s") != "ok":
             continue
-
         value = item.get("v", {})
         symbol = item.get("n") or value.get("symbol")
-
         if not symbol:
             continue
-
         quotes[symbol] = {
             "symbol": symbol,
             "lp": value.get("lp"),
@@ -93,7 +84,6 @@ def fetch_option_quotes(fyers, symbols):
             "ask": value.get("ask"),
             "volume": value.get("volume")
         }
-
     return quotes
 
 
@@ -102,12 +92,10 @@ def fetch_option_quotes(fyers, symbols):
 # ---------------------------------------------------------------------------
 
 def get_expiry_data(chain_response):
-    data = chain_response.get("data", {})
-    return data.get("expiryData", [])
+    return chain_response.get("data", {}).get("expiryData", [])
 
 def get_option_chain_rows(chain_response):
-    data = chain_response.get("data", {})
-    return data.get("optionsChain", [])
+    return chain_response.get("data", {}).get("optionsChain", [])
 
 def format_expiry(expiry_item):
     expiry_date = expiry_item.get("expiryDate") or expiry_item.get("date")
@@ -115,19 +103,15 @@ def format_expiry(expiry_item):
 
     if expiry_date:
         return str(expiry_date)
-
     if expiry_epoch:
         return str(expiry_epoch)
-
     return "Unknown"
 
 def get_expiry_value(expiry_item):
     if expiry_item.get("expiry") is not None:
         return int(expiry_item["expiry"])
-
     if expiry_item.get("expiryDate") is not None:
         return expiry_item["expiryDate"]
-
     return None
 
 def build_option_map(chain):
@@ -144,7 +128,6 @@ def build_option_map(chain):
 
         if option_type not in ("CE", "PE"):
             continue
-
         if strike_price is None or symbol is None:
             continue
 
@@ -153,9 +136,7 @@ def build_option_map(chain):
         except (TypeError, ValueError):
             continue
 
-        if strike not in option_map:
-            option_map[strike] = {}
-
+        option_map.setdefault(strike, {})
         option_map[strike][option_type] = symbol
 
     return option_map
@@ -190,7 +171,6 @@ def calculate_synthetic_future(selected_strikes, option_map, quotes):
 
         if not ce_quote:
             raise RuntimeError(f"CE quote missing: {ce_symbol}")
-
         if not pe_quote:
             raise RuntimeError(f"PE quote missing: {pe_symbol}")
 
@@ -214,33 +194,21 @@ def calculate_synthetic_future(selected_strikes, option_map, quotes):
         })
 
     df = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
-
     return df, float(df["Synthetic Future"].mean())
 
 def both_leg_strikes(option_map):
-    """Sorted strikes where both CE and PE are available."""
     return sorted(
         strike for strike, legs in option_map.items()
         if "CE" in legs and "PE" in legs
     )
 
 def find_closest_strike(option_map, price):
-    """Listed strike (with both CE and PE) closest to `price`."""
     candidates = both_leg_strikes(option_map)
-
     if not candidates:
-        raise RuntimeError(
-            "No strike with both CE and PE available."
-        )
-
+        raise RuntimeError("No strike with both CE and PE available.")
     return min(candidates, key=lambda strike: abs(strike - price))
 
 def select_three_around(option_map, center_strike):
-    """Strictly return the 3 adjacent both-leg strikes centred on center_strike.
-
-    Raises if the centre is at the edge of the loaded chain, if it's not in
-    the both-leg universe, or if the two neighbours are not adjacent strikes
-    (a CE or PE is missing between them)."""
     strikes = both_leg_strikes(option_map)
 
     if len(strikes) < 3:
@@ -277,48 +245,30 @@ def select_three_around(option_map, center_strike):
     return window, None
 
 def find_breakeven_strikes(option_map, center, straddle):
-    # Use the same both-leg universe as everything else.
     strikes = both_leg_strikes(option_map)
-
     if not strikes:
-        raise RuntimeError(
-            "No strikes available for breakeven calculation."
-        )
+        raise RuntimeError("No strikes available for breakeven calculation.")
 
     upper_breakeven = center + straddle
     lower_breakeven = center - straddle
 
-    upper_strike = min(
-        strikes,
-        key=lambda strike: abs(strike - upper_breakeven)
-    )
-
-    lower_strike = min(
-        strikes,
-        key=lambda strike: abs(strike - lower_breakeven)
-    )
+    upper_strike = min(strikes, key=lambda s: abs(s - upper_breakeven))
+    lower_strike = min(strikes, key=lambda s: abs(s - lower_breakeven))
 
     if "CE" not in option_map[upper_strike]:
         raise RuntimeError(
             f"CE unavailable at upper breakeven strike {upper_strike}."
         )
-
     if "PE" not in option_map[lower_strike]:
         raise RuntimeError(
             f"PE unavailable at lower breakeven strike {lower_strike}."
         )
 
-    return (
-        upper_breakeven,
-        lower_breakeven,
-        upper_strike,
-        lower_strike
-    )
+    return upper_breakeven, lower_breakeven, upper_strike, lower_strike
 
 def valid_number(value):
     if value is None:
         return False
-
     try:
         return math.isfinite(float(value))
     except (TypeError, ValueError):
@@ -329,7 +279,6 @@ def theta_ratio(theta, ltp, delta):
         return None
 
     denominator = abs(float(delta))
-
     if denominator == 0:
         return None
 
@@ -347,7 +296,6 @@ def calculate_deviations(selected_strikes, option_map, quotes):
 
         if not ce_quote:
             raise RuntimeError(f"CE quote missing: {ce_symbol}")
-
         if not pe_quote:
             raise RuntimeError(f"PE quote missing: {pe_symbol}")
 
@@ -356,10 +304,7 @@ def calculate_deviations(selected_strikes, option_map, quotes):
         pe_ltp = pe_quote.get("lp")
         pe_atp = pe_quote.get("atp")
 
-        if not all(
-            valid_number(x)
-            for x in [ce_ltp, ce_atp, pe_ltp, pe_atp]
-        ):
+        if not all(valid_number(x) for x in [ce_ltp, ce_atp, pe_ltp, pe_atp]):
             raise RuntimeError(
                 f"Invalid quote data for strike {strike}: "
                 f"CE LTP={ce_ltp}, CE ATP={ce_atp}, "
@@ -383,12 +328,7 @@ def calculate_deviations(selected_strikes, option_map, quotes):
             "PE LTP-ATP": pe_ltp - pe_atp
         })
 
-    result = (
-        pd.DataFrame(rows)
-        .sort_values("Strike")
-        .reset_index(drop=True)
-    )
-
+    result = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
     return (
         result,
         float(result["CE LTP-ATP"].mean()),
@@ -410,22 +350,18 @@ def format_ist_time(dt):
 
 def ms_until_next_boundary(step_seconds, buffer_ms=300):
     step_ms = max(int(step_seconds), 1) * 1000
-
     now = get_ist_time()
     ms_since_midnight = (
         ((now.hour * 60 + now.minute) * 60 + now.second) * 1000
         + now.microsecond // 1000
     )
-
     remainder = ms_since_midnight % step_ms
     wait = step_ms - remainder + buffer_ms
-
     return int(max(wait, 200))
 
 def install_autorefresh(enabled, refresh_seconds):
     if not enabled:
         return
-
     st_autorefresh(
         interval=ms_until_next_boundary(refresh_seconds),
         key="nifty_atp_refresh"
@@ -433,53 +369,8 @@ def install_autorefresh(enabled, refresh_seconds):
 
 
 # ---------------------------------------------------------------------------
-# Paper trade state
+# Signal logic
 # ---------------------------------------------------------------------------
-
-def initialize_paper_state():
-    if "paper_trade" not in st.session_state:
-        st.session_state.paper_trade = None
-
-    if "trade_log" not in st.session_state:
-        st.session_state.trade_log = []
-
-    if "manual_close_requested" not in st.session_state:
-        st.session_state.manual_close_requested = False
-
-    if st.session_state.paper_trade is not None:
-        trade = st.session_state.paper_trade
-
-        quantity = int(trade.get("quantity", 65))
-        lot_size = int(trade.get("lot_size", 65))
-        lots = int(
-            trade.get(
-                "lots",
-                max(1, round(quantity / lot_size))
-            )
-        )
-
-        trade["quantity"] = quantity
-        trade["lot_size"] = lot_size
-        trade["lots"] = lots
-
-        if "signal" not in trade:
-            trade["signal"] = ""
-
-        if "action" not in trade:
-            option_type = trade.get("option_type", "")
-            trade["action"] = f"SELL {option_type}"
-
-        if "entry_price" not in trade:
-            trade["entry_price"] = 0.0
-
-        if "entry_spot" not in trade:
-            trade["entry_spot"] = 0.0
-
-        if "entry_avg_ce_dev" not in trade:
-            trade["entry_avg_ce_dev"] = 0.0
-
-        if "entry_avg_pe_dev" not in trade:
-            trade["entry_avg_pe_dev"] = 0.0
 
 def check_buy_signal(avg_ce_dev, avg_pe_dev):
     return (
@@ -495,113 +386,12 @@ def check_sell_signal(avg_ce_dev, avg_pe_dev):
         and abs(avg_ce_dev) > 1.5 * abs(avg_pe_dev)
     )
 
-def check_exit_signal(trade, avg_ce_dev, avg_pe_dev):
-    if trade is None:
-        return False
-
-    option_type = trade.get("option_type")
-
-    if option_type == "PE":
-        return abs(avg_ce_dev) >= abs(avg_pe_dev)
-
-    if option_type == "CE":
-        return abs(avg_pe_dev) >= abs(avg_ce_dev)
-
-    return False
-
-def enter_paper_trade(
-    signal,
-    option_type,
-    strike,
-    symbol,
-    entry_price,
-    avg_ce_dev,
-    avg_pe_dev,
-    spot,
-    lots,
-    lot_size,
-    upper_breakeven,
-    lower_breakeven
-):
-    lots = int(lots)
-    lot_size = int(lot_size)
-    quantity = lots * lot_size
-
-    st.session_state.paper_trade = {
-        "signal": signal,
-        "action": f"SELL {option_type}",
-        "option_type": option_type,
-        "strike": float(strike),
-        "symbol": symbol,
-        "lots": lots,
-        "lot_size": lot_size,
-        "quantity": quantity,
-        "entry_price": float(entry_price),
-        "entry_time": get_ist_time(),
-        "entry_avg_ce_dev": float(avg_ce_dev),
-        "entry_avg_pe_dev": float(avg_pe_dev),
-        "entry_spot": float(spot),
-        "entry_upper_breakeven": float(upper_breakeven),
-        "entry_lower_breakeven": float(lower_breakeven)
-    }
-
-def exit_paper_trade(current_price, avg_ce_dev, avg_pe_dev, spot):
-    trade = st.session_state.paper_trade
-
-    if trade is None:
-        return
-
-    exit_time = get_ist_time()
-
-    entry_price = float(trade.get("entry_price", 0))
-    quantity = int(trade.get("quantity", 65))
-    lot_size = int(trade.get("lot_size", 65))
-    lots = int(
-        trade.get(
-            "lots",
-            max(1, round(quantity / lot_size))
-        )
-    )
-
-    current_price = float(current_price)
-    pnl = (entry_price - current_price) * quantity
-
-    trade_record = {
-        "Signal": trade.get("signal", ""),
-        "Action": trade.get("action", ""),
-        "Option": trade.get("option_type", ""),
-        "Strike": trade.get("strike", ""),
-        "Lots": lots,
-        "Qty": quantity,
-        "Entry Time": format_ist_time(trade.get("entry_time", exit_time)),
-        "Entry Price": entry_price,
-        "Exit Time": format_ist_time(exit_time),
-        "Exit Price": current_price,
-        "P&L": float(pnl),
-        "Entry Spot": float(trade.get("entry_spot", 0)),
-        "Exit Spot": float(spot),
-        "Entry Avg CE Dev": float(trade.get("entry_avg_ce_dev", 0)),
-        "Entry Avg PE Dev": float(trade.get("entry_avg_pe_dev", 0)),
-        "Exit Avg CE Dev": float(avg_ce_dev),
-        "Exit Avg PE Dev": float(avg_pe_dev),
-        "Entry Upper BE": trade.get("entry_upper_breakeven"),
-        "Entry Lower BE": trade.get("entry_lower_breakeven"),
-        "Symbol": trade.get("symbol", ""),
-        "Lot Size": lot_size
-    }
-
-    st.session_state.trade_log.append(trade_record)
-    st.session_state.paper_trade = None
-    st.session_state.manual_close_requested = False
-
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
-initialize_paper_state()
-
-st.title("NIFTY CE/PE ATP Paper Trade")
+st.title("NIFTY CE/PE ATP Signal")
 
 with st.sidebar:
     st.header("Settings")
@@ -618,21 +408,6 @@ with st.sidebar:
         step=1
     )
 
-    lots = st.number_input(
-        "Lots",
-        min_value=1,
-        max_value=50,
-        value=1,
-        step=1
-    )
-
-    lot_size = 65
-
-    st.caption(
-        f"Quantity: {int(lots * lot_size)} "
-        f"({int(lots)} × {lot_size})"
-    )
-
     autorefresh_enabled = st.checkbox("Auto Refresh", value=True)
 
     refresh_seconds = st.number_input(
@@ -642,23 +417,6 @@ with st.sidebar:
         value=15,
         step=1
     )
-
-    st.divider()
-
-    if st.button(
-        "Close Paper Position",
-        use_container_width=True,
-        disabled=st.session_state.paper_trade is None
-    ):
-        st.session_state.manual_close_requested = True
-        st.rerun()
-
-    if st.button(
-        "Clear Trade History",
-        use_container_width=True
-    ):
-        st.session_state.trade_log = []
-        st.rerun()
 
 install_autorefresh(autorefresh_enabled, refresh_seconds)
 
@@ -682,17 +440,12 @@ except Exception as e:
     st.stop()
 
 expiry_data = get_expiry_data(initial_chain)
-
 if not expiry_data:
     st.error("No expiry data returned by the option chain.")
     st.stop()
 
-expiry_labels = []
-expiry_values = []
-
-for item in expiry_data:
-    expiry_labels.append(format_expiry(item))
-    expiry_values.append(get_expiry_value(item))
+expiry_labels = [format_expiry(item) for item in expiry_data]
+expiry_values = [get_expiry_value(item) for item in expiry_data]
 
 expiry_index = st.sidebar.selectbox(
     "Expiry",
@@ -720,17 +473,14 @@ except Exception as e:
     st.stop()
 
 chain_rows = get_option_chain_rows(chain_response)
-
 if not chain_rows:
     st.error("No option chain rows returned.")
     st.stop()
 
 option_map = build_option_map(chain_rows)
-
 window_warnings = []
 
 strike_list = both_leg_strikes(option_map)
-
 if len(strike_list) < 3:
     st.error("Fewer than 3 strikes with both CE and PE in the option chain.")
     st.stop()
@@ -749,7 +499,6 @@ except Exception as e:
 
 # --- Step 1: quotes for spot ATM-1, ATM, ATM+1 -----------------------------
 trade_symbols = []
-
 for strike in selected_strikes:
     trade_symbols.append(option_map[strike]["CE"])
     trade_symbols.append(option_map[strike]["PE"])
@@ -760,7 +509,7 @@ except Exception as e:
     st.error(f"Option quotes fetch failed: {e}")
     st.stop()
 
-# --- Step 2: synthetic future on spot ATM window ---------------------------
+# --- Step 2: bootstrap synthetic future, Syn ATM, Syn ATM±1 ----------------
 try:
     syn_df, syn_fut = calculate_synthetic_future(
         selected_strikes,
@@ -768,21 +517,23 @@ try:
         quotes
     )
 
-    # Syn ATM = listed strike closest to the synthetic future
     atm = find_closest_strike(option_map, syn_fut)
-
-    # Deviation window = Syn ATM−1, Syn ATM, Syn ATM+1
     dev_strikes, _ = select_three_around(option_map, atm)
 except Exception as e:
     st.error(str(e))
     st.stop()
+
+role_map = {
+    dev_strikes[0]: "Syn ATM−1",
+    dev_strikes[1]: "Syn ATM",
+    dev_strikes[2]: "Syn ATM+1",
+}
 
 # --- Step 3: straddle at Syn ATM -------------------------------------------
 atm_ce_symbol = option_map[atm]["CE"]
 atm_pe_symbol = option_map[atm]["PE"]
 
 dev_symbols = []
-
 for strike in dev_strikes:
     dev_symbols.append(option_map[strike]["CE"])
     dev_symbols.append(option_map[strike]["PE"])
@@ -794,7 +545,6 @@ missing_dev_symbols = [
 
 if missing_dev_symbols:
     trade_symbols.extend(missing_dev_symbols)
-
     try:
         quotes.update(fetch_option_quotes(fyers, tuple(missing_dev_symbols)))
     except Exception as e:
@@ -846,41 +596,7 @@ if abs(lower_strike - lower_breakeven) > strike_step:
         f"(nearest listed strike {lower_strike:,.0f}). Increase Strike Count."
     )
 
-be_legs = []
-
-for be_label, be_strike, opt in (
-    ("Upper BE", upper_strike, "CE"),
-    ("Lower BE", lower_strike, "PE")
-):
-    sym = option_map[be_strike].get(opt)
-    if sym:
-        be_legs.append((be_label, be_strike, opt, sym))
-
-# --- Step 5: quotes still needed (breakeven legs + any open paper trade) ---
-extra_symbols = [
-    option_map[upper_strike]["CE"],
-    option_map[lower_strike]["PE"]
-]
-
-if st.session_state.paper_trade is not None:
-    open_trade_symbol = st.session_state.paper_trade.get("symbol")
-    if open_trade_symbol:
-        extra_symbols.append(open_trade_symbol)
-
-extra_symbols = [
-    sym for sym in dict.fromkeys(extra_symbols)
-    if sym not in quotes
-]
-
-if extra_symbols:
-    trade_symbols.extend(extra_symbols)
-
-    try:
-        quotes.update(fetch_option_quotes(fyers, tuple(extra_symbols)))
-    except Exception as e:
-        st.error(f"Option quotes fetch failed: {e}")
-        st.stop()
-
+# --- Step 5: deviations on the Syn ATM window ------------------------------
 try:
     (
         calculation_df,
@@ -891,46 +607,45 @@ except Exception as e:
     st.error(f"Deviation calculation failed: {e}")
     st.stop()
 
-# --- Synthetic future recomputed on the Syn ATM window (display only) ------
-# The strategy still uses `syn_fut` (bootstrap) for breakevens. This second
-# average is shown only so you can compare the two windows side-by-side.
+# --- Syn ATM-window synthetic future (display only) ------------------------
 syn_df_final, syn_fut_final = calculate_synthetic_future(
     dev_strikes,
     option_map,
     quotes
 )
 
-# Theta / (LTP x Delta) at breakeven strikes
+# --- Theta / (LTP × Delta) at Syn ATM−1, Syn ATM, Syn ATM+1 ---------------
 greeks_map = build_greeks_map(chain_rows)
 
 theta_rows = []
-
-for be_label, be_strike, opt, sym in be_legs:
-    g = greeks_map.get(sym, {})
-    g_ltp = g.get("ltp")
-    g_delta = g.get("delta")
-    g_theta = g.get("theta")
-
-    theta_rows.append({
-        "Level": be_label,
-        "Strike": be_strike,
-        "Type": opt,
-        "LTP (chain)": g_ltp,
-        "Delta": g_delta,
-        "Theta": g_theta,
-        "|Theta| / (LTP × |Delta|)": theta_ratio(g_theta, g_ltp, g_delta)
-    })
+for strike in dev_strikes:
+    for opt in ("CE", "PE"):
+        sym = option_map[strike].get(opt)
+        if not sym:
+            continue
+        g = greeks_map.get(sym, {})
+        g_ltp = g.get("ltp")
+        g_delta = g.get("delta")
+        g_theta = g.get("theta")
+        theta_rows.append({
+            "Role": role_map[strike],
+            "Strike": strike,
+            "Type": opt,
+            "LTP (chain)": g_ltp,
+            "Delta": g_delta,
+            "Theta": g_theta,
+            "|Theta| / (LTP × |Delta|)": theta_ratio(g_theta, g_ltp, g_delta)
+        })
 
 theta_df = pd.DataFrame(theta_rows)
 
-# CE / (CE + PE) and PE / (CE + PE) at Syn ATM-1, Syn ATM, Syn ATM+1
+# --- CE / PE share at Syn ATM±1 -------------------------------------------
 share_df = calculation_df[["Strike", "CE LTP", "PE LTP"]].copy()
 share_total = share_df["CE LTP"] + share_df["PE LTP"]
 
 share_df["CE / (CE+PE) %"] = (
     share_df["CE LTP"] / share_total.where(share_total > 0) * 100
 )
-
 share_df["PE / (CE+PE) %"] = (
     share_df["PE LTP"] / share_total.where(share_total > 0) * 100
 )
@@ -938,80 +653,13 @@ share_df["PE / (CE+PE) %"] = (
 avg_ce_share = float(share_df["CE / (CE+PE) %"].mean())
 avg_pe_share = float(share_df["PE / (CE+PE) %"].mean())
 
+# --- Signals --------------------------------------------------------------
 buy_signal = check_buy_signal(average_ce_deviation, average_pe_deviation)
 sell_signal = check_sell_signal(average_ce_deviation, average_pe_deviation)
-exit_signal = check_exit_signal(
-    st.session_state.paper_trade,
-    average_ce_deviation,
-    average_pe_deviation
-)
 
-if st.session_state.paper_trade is not None:
-    open_trade = st.session_state.paper_trade
-    current_symbol = open_trade.get("symbol")
-    current_quote = quotes.get(current_symbol)
-
-    if current_quote and valid_number(current_quote.get("lp")):
-        current_price = float(current_quote.get("lp"))
-
-        if st.session_state.manual_close_requested:
-            exit_paper_trade(
-                current_price,
-                average_ce_deviation,
-                average_pe_deviation,
-                spot
-            )
-            st.rerun()
-
-        if exit_signal:
-            exit_paper_trade(
-                current_price,
-                average_ce_deviation,
-                average_pe_deviation,
-                spot
-            )
-            st.rerun()
-
-else:
-    if buy_signal:
-        trade_symbol = option_map[lower_strike]["PE"]
-        trade_quote = quotes.get(trade_symbol)
-
-        if trade_quote and valid_number(trade_quote.get("lp")):
-            enter_paper_trade(
-                signal="BUY",
-                option_type="PE",
-                strike=lower_strike,
-                symbol=trade_symbol,
-                entry_price=float(trade_quote.get("lp")),
-                avg_ce_dev=average_ce_deviation,
-                avg_pe_dev=average_pe_deviation,
-                spot=spot,
-                lots=int(lots),
-                lot_size=lot_size,
-                upper_breakeven=upper_breakeven,
-                lower_breakeven=lower_breakeven
-            )
-
-    elif sell_signal:
-        trade_symbol = option_map[upper_strike]["CE"]
-        trade_quote = quotes.get(trade_symbol)
-
-        if trade_quote and valid_number(trade_quote.get("lp")):
-            enter_paper_trade(
-                signal="SELL",
-                option_type="CE",
-                strike=upper_strike,
-                symbol=trade_symbol,
-                entry_price=float(trade_quote.get("lp")),
-                avg_ce_dev=average_ce_deviation,
-                avg_pe_dev=average_pe_deviation,
-                spot=spot,
-                lots=int(lots),
-                lot_size=lot_size,
-                upper_breakeven=upper_breakeven,
-                lower_breakeven=lower_breakeven
-            )
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
 
 st.markdown(
     """
@@ -1038,72 +686,23 @@ st.caption(
 
 m = st.columns(9)
 
-# m[0].metric("Spot", f"{spot:,.2f}")
-# m[1].metric("Syn Future", f"{syn_fut:,.2f}")
-# m[2].metric("Syn Fut @ Syn ATM", f"{syn_fut_final:,.2f}")
-# m[3].metric("Syn ATM", f"{atm:,.0f}")
-# m[4].metric("Straddle @ Syn ATM", f"{atm_straddle:,.2f}")
-# m[5].metric("Upper BE Strike", f"{upper_strike:,.2f}")
-# m[6].metric("Lower BE Strike", f"{lower_strike:,.2f}")
-# m[7].metric("Avg CE Dev.", f"{average_ce_deviation:+,.2f}")
-# m[8].metric("Avg PE Dev.", f"{average_pe_deviation:+,.2f}")
-
 m[0].metric("Spot", f"{spot:,.2f}")
 m[1].metric("Syn Future", f"{syn_fut:,.2f}")
-# m[2].metric("Syn Fut @ Syn ATM", f"{syn_fut_final:,.2f}")
-m[2].metric("Syn ATM", f"{atm:,.0f}")
-m[3].metric("Straddle @ Syn ATM", f"{atm_straddle:,.2f}")
-m[4].metric("Upper BE Strike", f"{upper_strike:,.2f}")
-m[5].metric("Lower BE Strike", f"{lower_strike:,.2f}")
-m[6].metric("Avg CE Dev.", f"{average_ce_deviation:+,.2f}")
-m[7].metric("Avg PE Dev.", f"{average_pe_deviation:+,.2f}")
+m[2].metric("Syn Fut @ Syn ATM", f"{syn_fut_final:,.2f}")
+m[3].metric("Syn ATM", f"{atm:,.0f}")
+m[4].metric("Straddle @ Syn ATM", f"{atm_straddle:,.2f}")
+m[5].metric("Upper BE Strike", f"{upper_strike:,.2f}")
+m[6].metric("Lower BE Strike", f"{lower_strike:,.2f}")
+m[7].metric("Avg CE Dev.", f"{average_ce_deviation:+,.2f}")
+m[8].metric("Avg PE Dev.", f"{average_pe_deviation:+,.2f}")
 
-# ---------------------------------------------------------------------------
-# Synthetic Future — bootstrap (Spot ATM) window
-# ---------------------------------------------------------------------------
-
-st.subheader(
-    "Synthetic Future (Strike + CE LTP − PE LTP) — Spot ATM window"
-)
-
-syn_df_display = syn_df.copy()
-syn_df_display.insert(
-    0, "Role",
-    ["Spot ATM−1", "Spot ATM", "Spot ATM+1"]
-)
-
-st.dataframe(
-    syn_df_display,
-    use_container_width=True,
-    hide_index=True
-)
-
-st.write(
-    f"**Bootstrap window** (used to locate the Syn ATM): "
-    f"average = **{syn_fut:,.2f}**  |  "
-    f"Syn Future − Spot = {syn_fut - spot:+,.2f}"
-)
-
-st.caption(
-    "This window is around the **spot ATM**, not the Syn ATM. "
-    "The Syn ATM cannot be known until after this average is computed, "
-    "so a bootstrap window is unavoidable. The strategy's breakevens use "
-    "this bootstrap average."
-)
-
-# ---------------------------------------------------------------------------
-# Synthetic Future — signal (Syn ATM) window
-# ---------------------------------------------------------------------------
-
+# --- Synthetic Future — Syn ATM window --------------------------------------
 st.subheader(
     "Synthetic Future (Strike + CE LTP − PE LTP) — Syn ATM window"
 )
 
 syn_df_final_display = syn_df_final.copy()
-syn_df_final_display.insert(
-    0, "Role",
-    ["Syn ATM−1", "Syn ATM", "Syn ATM+1"]
-)
+syn_df_final_display.insert(0, "Role", ["Syn ATM−1", "Syn ATM", "Syn ATM+1"])
 
 st.dataframe(
     syn_df_final_display,
@@ -1112,22 +711,16 @@ st.dataframe(
 )
 
 st.write(
-    f"**Signal window** (strikes actually used for Avg CE/PE Dev): "
-    f"average = **{syn_fut_final:,.2f}**  |  "
-    f"Δ vs bootstrap = {syn_fut_final - syn_fut:+,.2f}"
+    f"**Synthetic Future on the signal strikes** = "
+    f"**{syn_fut_final:,.2f}**  |  "
+    f"Bootstrap average used for the breakevens = {syn_fut:,.2f}  |  "
+    f"Δ = {syn_fut_final - syn_fut:+,.2f}"
 )
 
 st.caption(
-    "These are the **same three strikes** used by the CE/(CE+PE) and "
-    "CE/PE LTP − ATP tables below. This second average is shown for "
-    "transparency so you can see the synthetic future on the actual "
-    "signal strikes."
-)
-
-st.caption(
-    f"Syn Future is {syn_fut - atm:+,.1f} pts from Syn ATM {atm:,.0f}. "
-    f"The Syn ATM (and the strikes used) switches to the next strike once "
-    f"this passes ±{strike_step / 2:,.1f} pts (strike step {strike_step:,.0f})."
+    "The breakevens below use the bootstrap average (from the spot ATM window). "
+    "The two averages only diverge meaningfully when the synthetic future sits "
+    "near the midpoint between two strikes."
 )
 
 st.subheader("Breakeven Strike Selection")
@@ -1149,17 +742,16 @@ be_df = pd.DataFrame([
 
 st.dataframe(be_df, use_container_width=True, hide_index=True)
 
+# --- CE / (CE+PE) at Syn ATM±1 ---------------------------------------------
 st.subheader("CE / (CE + PE) at Syn ATM−1, Syn ATM, Syn ATM+1")
 
 st.dataframe(share_df, use_container_width=True, hide_index=True)
 
 sh = st.columns(2)
-
 sh[0].metric(
     "Avg CE / (CE + PE)",
     "n/a" if pd.isna(avg_ce_share) else f"{avg_ce_share:.1f}%"
 )
-
 sh[1].metric(
     "Avg PE / (CE + PE)",
     "n/a" if pd.isna(avg_pe_share) else f"{avg_pe_share:.1f}%"
@@ -1171,22 +763,22 @@ st.caption(
     "three strikes."
 )
 
-st.subheader("Theta / (LTP × Delta) at Breakeven Strikes")
+# --- Theta / (LTP × Delta) at Syn ATM±1 -----------------------------------
+st.subheader(
+    "Theta / (LTP × Delta) at Syn ATM−1, Syn ATM, Syn ATM+1"
+)
 
 st.dataframe(theta_df, use_container_width=True, hide_index=True)
 
 st.caption(
     "Ratio = abs(Theta) / (LTP × abs(Delta)). "
-    "LTP, Delta and Theta are all from the same option chain snapshot."
+    "LTP, Delta and Theta are all from the same option chain snapshot. "
+    "Values are shown for both CE and PE at each of the three Syn ATM "
+    "signal strikes."
 )
 
+# --- CE / PE LTP − ATP -----------------------------------------------------
 st.subheader("CE / PE LTP − ATP (Syn ATM−1, Syn ATM, Syn ATM+1)")
-
-role_map = {
-    dev_strikes[0]: "Syn ATM−1",
-    dev_strikes[1]: "Syn ATM",
-    dev_strikes[2]: "Syn ATM+1",
-}
 
 display_df = calculation_df[
     [
@@ -1204,29 +796,23 @@ display_df.insert(0, "Role", display_df["Strike"].map(role_map))
 
 st.dataframe(display_df, use_container_width=True, hide_index=True)
 
+# --- Signal Conditions -----------------------------------------------------
 st.subheader("Signal Conditions")
 
-if st.session_state.paper_trade is None:
-    exit_condition_text = "No open position"
-else:
-    open_option = st.session_state.paper_trade.get("option_type", "")
-
-    if open_option == "PE":
-        exit_condition_text = "abs(Avg CE Dev) >= abs(Avg PE Dev)"
-    elif open_option == "CE":
-        exit_condition_text = "abs(Avg PE Dev) >= abs(Avg CE Dev)"
-    else:
-        exit_condition_text = "Invalid open position"
-
 signal_df = pd.DataFrame([
-    {"Condition": "Buy Signal", "Result": buy_signal},
-    {"Condition": "Sell Signal", "Result": sell_signal},
-    {"Condition": "Exit Signal", "Result": exit_signal},
-    {"Condition": exit_condition_text, "Result": exit_signal}
+    {
+        "Condition": "Buy Signal → SELL PE at Lower BE strike",
+        "Result": buy_signal
+    },
+    {
+        "Condition": "Sell Signal → SELL CE at Upper BE strike",
+        "Result": sell_signal
+    }
 ])
 
 st.dataframe(signal_df, use_container_width=True, hide_index=True)
 
+# --- Calculation breakdown -------------------------------------------------
 st.subheader("Calculation")
 
 for _, row in calculation_df.iterrows():
@@ -1268,7 +854,6 @@ for _, row in share_df.iterrows():
 ce_share_text = " + ".join(
     f"{x:.1f}%" for x in share_df["CE / (CE+PE) %"].tolist()
 )
-
 pe_share_text = " + ".join(
     f"{x:.1f}%" for x in share_df["PE / (CE+PE) %"].tolist()
 )
@@ -1283,66 +868,9 @@ st.write(
     f"**{avg_pe_share:.1f}%**"
 )
 
-st.subheader("Paper Trade")
-
-if st.session_state.paper_trade is None:
-    st.info("No open paper position.")
-else:
-    trade = st.session_state.paper_trade
-    current_quote = quotes.get(trade.get("symbol"))
-    current_price = None
-    unrealized_pnl = None
-
-    if current_quote and valid_number(current_quote.get("lp")):
-        current_price = float(current_quote.get("lp"))
-        unrealized_pnl = (
-            float(trade.get("entry_price", 0)) - current_price
-        ) * int(trade.get("quantity", 65))
-
-    open_trade_df = pd.DataFrame([
-        {
-            "Signal": trade.get("signal", ""),
-            "Action": trade.get("action", ""),
-            "Option": trade.get("option_type", ""),
-            "Strike": trade.get("strike", ""),
-            "Lots": trade.get("lots", 1),
-            "Qty": trade.get("quantity", 65),
-            "Entry Price": trade.get("entry_price", 0),
-            "Current Price": current_price,
-            "Unrealized P&L": unrealized_pnl,
-            "Entry Time": format_ist_time(
-                trade.get("entry_time", get_ist_time())
-            ),
-            "Entry Spot": trade.get("entry_spot", 0),
-            "Symbol": trade.get("symbol", "")
-        }
-    ])
-
-    st.dataframe(open_trade_df, use_container_width=True, hide_index=True)
-
-st.subheader("Trade Log")
-
-if st.session_state.trade_log:
-    trade_log_df = pd.DataFrame(st.session_state.trade_log)
-    total_pnl = trade_log_df["P&L"].sum()
-    total_trades = len(trade_log_df)
-    winning_trades = (trade_log_df["P&L"] > 0).sum()
-    losing_trades = (trade_log_df["P&L"] < 0).sum()
-
-    p = st.columns(4)
-
-    p[0].metric("Closed Trades", total_trades)
-    p[1].metric("Winning Trades", int(winning_trades))
-    p[2].metric("Losing Trades", int(losing_trades))
-    p[3].metric("Total P&L", f"₹{total_pnl:,.2f}")
-
-    st.dataframe(trade_log_df, use_container_width=True, hide_index=True)
-else:
-    st.info("No completed paper trades yet.")
-
+# --- Raw quotes -----------------------------------------------------------
 with st.expander("Raw Quotes API Data"):
     raw_rows = []
-
     for symbol in dict.fromkeys(trade_symbols):
         quote = quotes.get(symbol, {})
         raw_rows.append({
@@ -1360,6 +888,7 @@ with st.expander("Raw Quotes API Data"):
         hide_index=True
     )
 
+# --- Strategy formula ------------------------------------------------------
 with st.expander("Strategy Formula"):
     st.latex(r"CE_{dev}=CE_{LTP}-CE_{ATP}")
     st.latex(r"PE_{dev}=PE_{LTP}-PE_{ATP}")
@@ -1384,14 +913,6 @@ with st.expander("Strategy Formula"):
         r",\quad "
         r"PE\ Share_{K}=\frac{PE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
     )
-    st.latex(
-        r"Avg\ CE\ Share="
-        r"\frac{CEShare_{SynATM-1}+CEShare_{SynATM}+CEShare_{SynATM+1}}{3}"
-    )
-    st.latex(
-        r"Avg\ PE\ Share="
-        r"\frac{PEShare_{SynATM-1}+PEShare_{SynATM}+PEShare_{SynATM+1}}{3}"
-    )
     st.latex(r"Theta\ Ratio=\frac{|\Theta|}{LTP\times|\Delta|}")
 
     st.write(
@@ -1399,21 +920,21 @@ with st.expander("Strategy Formula"):
         "and abs(Avg PE Dev) > 1.5 × abs(Avg CE Dev)."
     )
     st.write(
-        "Buy signal: SELL the selected number of lots "
-        "of the PE at the strike closest to the Lower BE."
+        "Buy signal suggests shorting the PE at the strike closest to the "
+        "Lower BE."
     )
     st.write(
         "Sell signal: Avg PE Dev > 0, Avg CE Dev < 0, "
         "and abs(Avg CE Dev) > 1.5 × abs(Avg PE Dev)."
     )
     st.write(
-        "Sell signal: SELL the selected number of lots "
-        "of the CE at the strike closest to the Upper BE."
+        "Sell signal suggests shorting the CE at the strike closest to the "
+        "Upper BE."
     )
-    st.write("Short PE exit: abs(Avg CE Dev) >= abs(Avg PE Dev).")
-    st.write("Short CE exit: abs(Avg PE Dev) >= abs(Avg CE Dev).")
-    st.write("Lot size: 65 quantity per lot.")
-    st.write("All trades are paper trades. No orders are sent to Fyers.")
+    st.write(
+        "All values are informational signals only. No orders are sent to "
+        "Fyers."
+    )
 
 if st.button("Manual Refresh"):
     st.rerun()
