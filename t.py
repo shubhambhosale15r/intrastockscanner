@@ -54,7 +54,6 @@ def fetch_option_quotes(fyers, symbols):
     symbols = list(dict.fromkeys(symbols))
     if not symbols:
         return {}
-
     quotes = {}
     for i in range(0, len(symbols), 50):
         batch = symbols[i:i + 50]
@@ -198,8 +197,8 @@ def select_three_around(option_map, center_strike):
     if index == 0 or index == len(strikes) - 1:
         raise RuntimeError(
             f"{center_strike:,.0f} is at the edge of the loaded chain, so it "
-            f"cannot be the centre of a Syn ATM−1 / Syn ATM / Syn ATM+1 "
-            f"window (loaded range {int(strikes[0]):,}–{int(strikes[-1]):,}). "
+            f"cannot be the centre of a 3-strike window "
+            f"(loaded range {int(strikes[0]):,}–{int(strikes[-1]):,}). "
             f"Increase Strike Count in the sidebar."
         )
     window = strikes[index - 1:index + 2]
@@ -339,7 +338,6 @@ if not expiry_data:
 expiry_labels = [format_expiry(item) for item in expiry_data]
 expiry_values = [get_expiry_value(item) for item in expiry_data]
 
-# --- Expiry selector — inside the sidebar, own section ---------------------
 with st.sidebar:
     st.divider()
     st.subheader("Expiry")
@@ -487,43 +485,51 @@ if abs(lower_strike - lower_breakeven) > strike_step:
         f"(nearest listed strike {lower_strike:,.0f}). Increase Strike Count."
     )
 
-# --- Step 5: OTM CE and OTM PE strike windows ------------------------------
+# --- Step 5: raw OTM CE and OTM PE windows --------------------------------
 all_loaded_strikes = both_leg_strikes(option_map)
 
-# OTM CE: strictly above Syn ATM, up to and including Upper BE strike
-otm_ce_strikes = [
+otm_ce_strikes_raw = [
     s for s in all_loaded_strikes if atm < s <= upper_strike
 ]
-
-# OTM PE: strictly below Syn ATM, down to and including Lower BE strike
-otm_pe_strikes = [
+otm_pe_strikes_raw = [
     s for s in all_loaded_strikes if lower_strike <= s < atm
 ]
 
-if not otm_ce_strikes:
+if not otm_ce_strikes_raw:
     st.error(
         f"No OTM CE strikes between Syn ATM ({atm:,.0f}) and Upper BE strike "
-        f"({upper_strike:,.0f}). The straddle may be too small relative to "
-        f"the strike step, or the Upper BE falls on/inside the Syn ATM. "
-        f"Increase Strike Count or check the chain."
+        f"({upper_strike:,.0f}). Increase Strike Count or check the chain."
     )
     st.stop()
 
-if not otm_pe_strikes:
+if not otm_pe_strikes_raw:
     st.error(
         f"No OTM PE strikes between Lower BE strike ({lower_strike:,.0f}) and "
-        f"Syn ATM ({atm:,.0f}). The straddle may be too small relative to "
-        f"the strike step, or the Lower BE falls on/inside the Syn ATM. "
-        f"Increase Strike Count or check the chain."
+        f"Syn ATM ({atm:,.0f}). Increase Strike Count or check the chain."
     )
     st.stop()
 
-all_otm_strikes = sorted(otm_ce_strikes + otm_pe_strikes)
+# --- Step 5.5: match counts — min(N_CE, N_PE) strikes on each side --------
+n_ce_raw = len(otm_ce_strikes_raw)
+n_pe_raw = len(otm_pe_strikes_raw)
+n_common = min(n_ce_raw, n_pe_raw)
+
+# otm_ce_strikes_raw is ascending; innermost = first N (smallest = closest to ATM)
+otm_ce_strikes = sorted(otm_ce_strikes_raw)[:n_common]
+
+# otm_pe_strikes_raw is ascending; innermost = last N (largest = closest to ATM)
+otm_pe_strikes = sorted(otm_pe_strikes_raw, reverse=True)[:n_common]
+otm_pe_strikes = sorted(otm_pe_strikes)  # re-sort ascending for display
+
+dropped_ce = [s for s in otm_ce_strikes_raw if s not in otm_ce_strikes]
+dropped_pe = [s for s in otm_pe_strikes_raw if s not in otm_pe_strikes]
 
 otm_role_map = {s: "OTM CE" for s in otm_ce_strikes}
 otm_role_map.update({s: "OTM PE" for s in otm_pe_strikes})
 
-# --- Step 6: fetch quotes for all OTM strikes -----------------------------
+all_otm_strikes = sorted(otm_ce_strikes + otm_pe_strikes)
+
+# --- Step 6: fetch quotes for all (trimmed) OTM strikes -------------------
 otm_symbols = []
 for strike in all_otm_strikes:
     otm_symbols.append(option_map[strike]["CE"])
@@ -542,9 +548,8 @@ if missing_otm_symbols:
         st.error(f"OTM strike quotes fetch failed: {e}")
         st.stop()
 
-# --- Step 7: OTM-based deviations, theta, share ---------------------------
+# --- Step 7: OTM-based deviations + share --------------------------------
 otm_dev_rows = []
-otm_theta_rows = []
 otm_share_rows = []
 
 for strike in all_otm_strikes:
@@ -582,9 +587,6 @@ for strike in all_otm_strikes:
         "PE LTP-ATP": pe_ltp - pe_atp,
     })
 
-    ce_g = greeks_map_placeholder = None  # will fill after greeks_map built
-    # Greeks computed later from chain; placeholder replaced below
-
     total = ce_ltp + pe_ltp
     otm_share_rows.append({
         "Role": role,
@@ -598,9 +600,10 @@ for strike in all_otm_strikes:
 otm_dev_df = pd.DataFrame(otm_dev_rows)
 otm_share_df = pd.DataFrame(otm_share_rows)
 
-# Greeks map from full chain
+# Greeks map from full chain — build theta rows
 greeks_map = build_greeks_map(chain_rows)
 
+otm_theta_rows = []
 for strike in all_otm_strikes:
     role = otm_role_map[strike]
     ce_sym = option_map[strike]["CE"]
@@ -628,20 +631,44 @@ for strike in all_otm_strikes:
 otm_theta_df = pd.DataFrame(otm_theta_rows)
 
 # --- Step 8: OTM-based averages (CE over OTM CE, PE over OTM PE) ----------
-ce_dev_values = otm_dev_df.loc[otm_dev_df["Role"] == "OTM CE", "CE LTP-ATP"].tolist()
-pe_dev_values = otm_dev_df.loc[otm_dev_df["Role"] == "OTM PE", "PE LTP-ATP"].tolist()
+ce_dev_values = otm_dev_df.loc[
+    otm_dev_df["Role"] == "OTM CE", "CE LTP-ATP"
+].tolist()
+pe_dev_values = otm_dev_df.loc[
+    otm_dev_df["Role"] == "OTM PE", "PE LTP-ATP"
+].tolist()
 average_ce_deviation = float(sum(ce_dev_values) / len(ce_dev_values))
 average_pe_deviation = float(sum(pe_dev_values) / len(pe_dev_values))
 
-ce_theta_values = otm_theta_df.loc[otm_theta_df["Role"] == "OTM CE", "CE |Θ| / |Δ|"].dropna().tolist()
-pe_theta_values = otm_theta_df.loc[otm_theta_df["Role"] == "OTM PE", "PE |Θ| / |Δ|"].dropna().tolist()
-avg_ce_theta_ratio = float(sum(ce_theta_values) / len(ce_theta_values)) if ce_theta_values else float("nan")
-avg_pe_theta_ratio = float(sum(pe_theta_values) / len(pe_theta_values)) if pe_theta_values else float("nan")
+ce_theta_values = otm_theta_df.loc[
+    otm_theta_df["Role"] == "OTM CE", "CE |Θ| / |Δ|"
+].dropna().tolist()
+pe_theta_values = otm_theta_df.loc[
+    otm_theta_df["Role"] == "OTM PE", "PE |Θ| / |Δ|"
+].dropna().tolist()
+avg_ce_theta_ratio = (
+    float(sum(ce_theta_values) / len(ce_theta_values))
+    if ce_theta_values else float("nan")
+)
+avg_pe_theta_ratio = (
+    float(sum(pe_theta_values) / len(pe_theta_values))
+    if pe_theta_values else float("nan")
+)
 
-ce_share_values = otm_share_df.loc[otm_share_df["Role"] == "OTM CE", "CE / (CE+PE) %"].dropna().tolist()
-pe_share_values = otm_share_df.loc[otm_share_df["Role"] == "OTM PE", "PE / (CE+PE) %"].dropna().tolist()
-avg_ce_share = float(sum(ce_share_values) / len(ce_share_values)) if ce_share_values else float("nan")
-avg_pe_share = float(sum(pe_share_values) / len(pe_share_values)) if pe_share_values else float("nan")
+ce_share_values = otm_share_df.loc[
+    otm_share_df["Role"] == "OTM CE", "CE / (CE+PE) %"
+].dropna().tolist()
+pe_share_values = otm_share_df.loc[
+    otm_share_df["Role"] == "OTM PE", "PE / (CE+PE) %"
+].dropna().tolist()
+avg_ce_share = (
+    float(sum(ce_share_values) / len(ce_share_values))
+    if ce_share_values else float("nan")
+)
+avg_pe_share = (
+    float(sum(pe_share_values) / len(pe_share_values))
+    if pe_share_values else float("nan")
+)
 
 # --- Syn ATM-window synthetic future (display only) -----------------------
 syn_df_final, syn_fut_final = calculate_synthetic_future(
@@ -657,12 +684,8 @@ syn_df_final, syn_fut_final = calculate_synthetic_future(
 st.markdown(
     """
     <style>
-    [data-testid="stMetricValue"] {
-        font-size: 22px !important;
-    }
-    [data-testid="stMetricLabel"] p {
-        font-size: 13px !important;
-    }
+    [data-testid="stMetricValue"] { font-size: 22px !important; }
+    [data-testid="stMetricLabel"] p { font-size: 13px !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -677,7 +700,27 @@ st.caption(
     f"({len(strike_list)} strikes, step {int(strike_step)})"
 )
 
-# --- Metrics in a 3-column grid -------------------------------------------
+# --- Truncation info box ---------------------------------------------------
+if dropped_ce or dropped_pe:
+    dropped_bits = []
+    if dropped_ce:
+        dropped_bits.append(
+            f"dropped OTM CE strike(s) {[int(s) for s in dropped_ce]} "
+            f"(outermost, nearest Upper BE strike)"
+        )
+    if dropped_pe:
+        dropped_bits.append(
+            f"dropped OTM PE strike(s) {[int(s) for s in dropped_pe]} "
+            f"(outermost, nearest Lower BE strike)"
+        )
+    st.info(
+        f"OTM strike counts matched to **N = {n_common} per side** "
+        f"(raw: {n_ce_raw} OTM CE / {n_pe_raw} OTM PE). Kept the innermost "
+        f"N strikes on each side (closest to Syn ATM {int(atm):,}). "
+        f"{' · '.join(dropped_bits)}."
+    )
+
+# --- Metrics --------------------------------------------------------------
 row1 = st.columns(3)
 row1[0].metric("Spot", f"{spot:,.2f}")
 row1[1].metric("Syn Future", f"{syn_fut:,.2f}")
@@ -712,14 +755,13 @@ row5[0].metric(
     "Avg PE / (CE + PE)",
     "n/a" if pd.isna(avg_pe_share) else f"{avg_pe_share:.1f}%"
 )
+row5[1].metric("OTM Strikes / Side", str(n_common))
 
-# --- OTM strike summary caption -------------------------------------------
+# --- OTM window summary ---------------------------------------------------
 st.caption(
-    f"**OTM CE strikes** ({len(otm_ce_strikes)}) — above Syn ATM {int(atm):,} "
-    f"up to Upper BE strike {int(upper_strike):,}: "
+    f"**OTM CE** ({len(otm_ce_strikes)}): "
     f"{[int(s) for s in otm_ce_strikes]}  ·  "
-    f"**OTM PE strikes** ({len(otm_pe_strikes)}) — from Lower BE strike "
-    f"{int(lower_strike):,} up to (but not incl.) Syn ATM {int(atm):,}: "
+    f"**OTM PE** ({len(otm_pe_strikes)}): "
     f"{[int(s) for s in otm_pe_strikes]}"
 )
 
@@ -788,16 +830,14 @@ sh[1].metric(
 )
 
 st.caption(
-    f"Avg CE share = mean of CE/(CE+PE) over the {len(otm_ce_strikes)} OTM CE "
-    f"strikes. Avg PE share = mean of PE/(CE+PE) over the "
-    f"{len(otm_pe_strikes)} OTM PE strikes. Rows are marked OTM CE / OTM PE "
-    f"in the Role column."
+    f"Avg CE share = mean of CE/(CE+PE) over the **{len(otm_ce_strikes)}** "
+    f"OTM CE strikes. Avg PE share = mean of PE/(CE+PE) over the "
+    f"**{len(otm_pe_strikes)}** OTM PE strikes (counts matched to N="
+    f"{n_common}). Rows are marked OTM CE / OTM PE in the Role column."
 )
 
 # --- |Theta| / |Delta| at OTM strikes -------------------------------------
-st.subheader(
-    "|Theta| / |Delta| at OTM Strikes"
-)
+st.subheader("|Theta| / |Delta| at OTM Strikes")
 
 st.dataframe(otm_theta_df, use_container_width=True, hide_index=True)
 
@@ -812,8 +852,8 @@ th[1].metric(
 )
 
 st.caption(
-    f"Avg CE |Θ|/|Δ| = mean over the {len(otm_ce_strikes)} OTM CE strikes. "
-    f"Avg PE |Θ|/|Δ| = mean over the {len(otm_pe_strikes)} OTM PE strikes. "
+    f"Avg CE |Θ|/|Δ| = mean over the **{len(otm_ce_strikes)}** OTM CE strikes. "
+    f"Avg PE |Θ|/|Δ| = mean over the **{len(otm_pe_strikes)}** OTM PE strikes. "
     f"Ratio = abs(Theta) / abs(Delta) from the same chain snapshot."
 )
 
@@ -827,13 +867,13 @@ dv[0].metric("Avg CE LTP−ATP", f"{average_ce_deviation:+,.2f}")
 dv[1].metric("Avg PE LTP−ATP", f"{average_pe_deviation:+,.2f}")
 
 st.caption(
-    f"Avg CE LTP−ATP = mean over the {len(otm_ce_strikes)} OTM CE strikes. "
-    f"Avg PE LTP−ATP = mean over the {len(otm_pe_strikes)} OTM PE strikes. "
+    f"Avg CE LTP−ATP = mean over the **{len(otm_ce_strikes)}** OTM CE strikes. "
+    f"Avg PE LTP−ATP = mean over the **{len(otm_pe_strikes)}** OTM PE strikes. "
     f"These are the same values shown as Avg CE Dev. / Avg PE Dev. in the "
     f"top metrics."
 )
 
-# --- Calculation breakdown (OTM) ------------------------------------------
+# --- Calculation breakdown ------------------------------------------------
 st.subheader("Calculation")
 
 ce_dev_df = otm_dev_df[otm_dev_df["Role"] == "OTM CE"]
@@ -908,7 +948,7 @@ if not pe_share_df.empty:
         f"**{avg_pe_share:.1f}%**"
     )
 
-# --- Raw quotes -----------------------------------------------------------
+# --- Raw quotes ----------------------------------------------------------
 with st.expander("Raw Quotes API Data"):
     raw_rows = []
     for symbol in dict.fromkeys(trade_symbols):
@@ -927,23 +967,32 @@ with st.expander("Raw Quotes API Data"):
         hide_index=True
     )
 
-# --- Strategy formula -----------------------------------------------------
+# --- Strategy formula ----------------------------------------------------
 with st.expander("Strategy Formula"):
     st.latex(r"CE_{dev}=CE_{LTP}-CE_{ATP}")
     st.latex(r"PE_{dev}=PE_{LTP}-PE_{ATP}")
     st.latex(
-        r"OTM\ CE=\{K\in strikes : SynATM<K\leq UpperBE\ Strike\}"
+        r"OTM\ CE^{raw}=\{K: SynATM<K\leq UpperBE\ Strike\}"
     )
     st.latex(
-        r"OTM\ PE=\{K\in strikes : LowerBE\ Strike\leq K<SynATM\}"
+        r"OTM\ PE^{raw}=\{K: LowerBE\ Strike\leq K<SynATM\}"
     )
     st.latex(
-        r"AvgCEDev=\frac{1}{N_{CE}}"
-        r"\sum_{K\in OTM\ CE}(CE_{LTP,K}-CE_{ATP,K})"
+        r"N=\min(N_{CE}^{raw},\ N_{PE}^{raw})"
     )
     st.latex(
-        r"AvgPEDev=\frac{1}{N_{PE}}"
-        r"\sum_{K\in OTM\ PE}(PE_{LTP,K}-PE_{ATP,K})"
+        r"OTM\ CE = \text{innermost }N\text{ strikes of }OTM\ CE^{raw}"
+        r"\quad(\text{closest to }SynATM)"
+    )
+    st.latex(
+        r"OTM\ PE = \text{innermost }N\text{ strikes of }OTM\ PE^{raw}"
+        r"\quad(\text{closest to }SynATM)"
+    )
+    st.latex(
+        r"AvgCEDev=\frac{1}{N}\sum_{K\in OTM\ CE}(CE_{LTP,K}-CE_{ATP,K})"
+    )
+    st.latex(
+        r"AvgPEDev=\frac{1}{N}\sum_{K\in OTM\ PE}(PE_{LTP,K}-PE_{ATP,K})"
     )
     st.latex(r"SynFut_{K}=K+CE_{LTP,K}-PE_{LTP,K}")
     st.latex(
@@ -959,23 +1008,19 @@ with st.expander("Strategy Formula"):
         r"PE\ Share_{K}=\frac{PE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
     )
     st.latex(
-        r"Avg\ CE\ Share=\frac{1}{N_{CE}}"
-        r"\sum_{K\in OTM\ CE}CE\ Share_{K}"
+        r"Avg\ CE\ Share=\frac{1}{N}\sum_{K\in OTM\ CE}CE\ Share_{K}"
     )
     st.latex(
-        r"Avg\ PE\ Share=\frac{1}{N_{PE}}"
-        r"\sum_{K\in OTM\ PE}PE\ Share_{K}"
+        r"Avg\ PE\ Share=\frac{1}{N}\sum_{K\in OTM\ PE}PE\ Share_{K}"
     )
     st.latex(r"Theta\ Ratio_{K}=\frac{|\Theta_{K}|}{|\Delta_{K}|}")
     st.latex(
-        r"Avg\ CE\ Theta\ Ratio=\frac{1}{N_{CE}}"
-        r"\sum_{K\in OTM\ CE}"
-        r"\frac{|\Theta_{CE,K}|}{|\Delta_{CE,K}|}"
+        r"Avg\ CE\ Theta\ Ratio=\frac{1}{N}"
+        r"\sum_{K\in OTM\ CE}\frac{|\Theta_{CE,K}|}{|\Delta_{CE,K}|}"
     )
     st.latex(
-        r"Avg\ PE\ Theta\ Ratio=\frac{1}{N_{PE}}"
-        r"\sum_{K\in OTM\ PE}"
-        r"\frac{|\Theta_{PE,K}|}{|\Delta_{PE,K}|}"
+        r"Avg\ PE\ Theta\ Ratio=\frac{1}{N}"
+        r"\sum_{K\in OTM\ PE}\frac{|\Theta_{PE,K}|}{|\Delta_{PE,K}|}"
     )
 
     st.write(
@@ -987,9 +1032,10 @@ with st.expander("Strategy Formula"):
         "down to and including the Lower BE strike."
     )
     st.write(
-        "All three averages (Dev, |Θ|/|Δ|, CE/PE share) are computed over "
-        "these OTM windows — CE side over OTM CE strikes, PE side over OTM "
-        "PE strikes."
+        "**Count matching:** N = min(N_CE, N_PE). The longer side is "
+        "trimmed to its innermost N strikes (the ones closest to the Syn "
+        "ATM), so both sides contribute the same number of data points to "
+        "every average."
     )
     st.write(
         "All values are informational signals only. No orders are sent to "
