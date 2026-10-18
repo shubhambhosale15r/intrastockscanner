@@ -209,7 +209,92 @@ def select_three_strikes(option_map, spot):
 
     return selected, strikes[atm_index]
 
-def find_breakeven_strikes(option_map, spot, atm_straddle):
+def calculate_synthetic_future(selected_strikes, option_map, quotes):
+    """Synthetic future per strike = Strike + CE LTP - PE LTP.
+    Returns a per-strike table and the average of the synthetic futures."""
+    rows = []
+
+    for strike in selected_strikes:
+        ce_symbol = option_map[strike]["CE"]
+        pe_symbol = option_map[strike]["PE"]
+
+        ce_quote = quotes.get(ce_symbol)
+        pe_quote = quotes.get(pe_symbol)
+
+        if not ce_quote:
+            raise RuntimeError(f"CE quote missing: {ce_symbol}")
+
+        if not pe_quote:
+            raise RuntimeError(f"PE quote missing: {pe_symbol}")
+
+        ce_ltp = ce_quote.get("lp")
+        pe_ltp = pe_quote.get("lp")
+
+        if not (valid_number(ce_ltp) and valid_number(pe_ltp)):
+            raise RuntimeError(
+                f"Invalid LTP for synthetic future at strike {strike}: "
+                f"CE={ce_ltp}, PE={pe_ltp}"
+            )
+
+        ce_ltp = float(ce_ltp)
+        pe_ltp = float(pe_ltp)
+
+        rows.append({
+            "Strike": strike,
+            "CE LTP": ce_ltp,
+            "PE LTP": pe_ltp,
+            "Synthetic Future": strike + ce_ltp - pe_ltp
+        })
+
+    df = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
+
+    return df, float(df["Synthetic Future"].mean())
+
+def find_synthetic_atm(option_map, syn_fut):
+    """Listed strike (with both CE and PE) closest to the synthetic future."""
+    candidates = sorted(
+        strike for strike, legs in option_map.items()
+        if "CE" in legs and "PE" in legs
+    )
+
+    if not candidates:
+        raise RuntimeError(
+            "No strike with both CE and PE available for synthetic ATM."
+        )
+
+    return min(candidates, key=lambda strike: abs(strike - syn_fut))
+
+def select_three_around(option_map, center_strike):
+    """Listed strikes (both CE and PE available) just below, at and just
+    above center_strike."""
+    strikes = sorted(
+        strike for strike, legs in option_map.items()
+        if "CE" in legs and "PE" in legs
+    )
+
+    index = strikes.index(center_strike)
+
+    if index == 0 or index == len(strikes) - 1:
+        raise RuntimeError(
+            "Unable to select Syn ATM-1, Syn ATM and Syn ATM+1 "
+            "from the available strikes."
+        )
+
+    return strikes[index - 1:index + 2]
+
+def premium_share(ce_ltp, pe_ltp):
+    """CE / (CE + PE) and PE / (CE + PE). (None, None) if not computable."""
+    if not (valid_number(ce_ltp) and valid_number(pe_ltp)):
+        return None, None
+
+    total = float(ce_ltp) + float(pe_ltp)
+
+    if total <= 0:
+        return None, None
+
+    return float(ce_ltp) / total, float(pe_ltp) / total
+
+def find_breakeven_strikes(option_map, center, straddle):
     strikes = sorted(option_map.keys())
 
     if not strikes:
@@ -217,8 +302,8 @@ def find_breakeven_strikes(option_map, spot, atm_straddle):
             "No strikes available for breakeven calculation."
         )
 
-    upper_breakeven = spot + atm_straddle
-    lower_breakeven = spot - atm_straddle
+    upper_breakeven = center + straddle
+    lower_breakeven = center - straddle
 
     upper_strike = min(
         strikes,
@@ -779,7 +864,7 @@ option_map = build_option_map(
 )
 
 try:
-    selected_strikes, atm = select_three_strikes(
+    selected_strikes, spot_atm = select_three_strikes(
         option_map,
         spot
     )
@@ -787,127 +872,12 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-atm_ce_symbol = option_map[atm]["CE"]
-atm_pe_symbol = option_map[atm]["PE"]
-
-try:
-    atm_quotes = fetch_option_quotes(
-        fyers,
-        (
-            atm_ce_symbol,
-            atm_pe_symbol
-        )
-    )
-except Exception as e:
-    st.error(
-        f"ATM option quotes fetch failed: {e}"
-    )
-    st.stop()
-
-atm_ce_quote = atm_quotes.get(
-    atm_ce_symbol
-)
-
-atm_pe_quote = atm_quotes.get(
-    atm_pe_symbol
-)
-
-if not atm_ce_quote or not atm_pe_quote:
-    st.error(
-        "ATM CE/PE quotes unavailable."
-    )
-    st.stop()
-
-atm_ce_ltp = atm_ce_quote.get("lp")
-atm_pe_ltp = atm_pe_quote.get("lp")
-
-if (
-    not valid_number(atm_ce_ltp)
-    or not valid_number(atm_pe_ltp)
-):
-    st.error(
-        f"Invalid ATM option prices: "
-        f"CE={atm_ce_ltp}, PE={atm_pe_ltp}"
-    )
-    st.stop()
-
-atm_ce_ltp = float(atm_ce_ltp)
-atm_pe_ltp = float(atm_pe_ltp)
-
-atm_straddle = (
-    atm_ce_ltp +
-    atm_pe_ltp
-)
-
-try:
-    (
-        upper_breakeven,
-        lower_breakeven,
-        upper_strike,
-        lower_strike
-    ) = find_breakeven_strikes(
-        option_map,
-        spot,
-        atm_straddle
-    )
-except Exception as e:
-    st.error(str(e))
-    st.stop()
-
-# Both CE and PE at each breakeven strike (used for the theta ratio table)
-# be_legs = []
-
-# for be_label, be_strike in (
-#     ("Upper BE", upper_strike),
-#     ("Lower BE", lower_strike)
-# ):
-#     for opt in ("CE", "PE"):
-#         sym = option_map[be_strike].get(opt)
-#         if sym:
-#             be_legs.append((be_label, be_strike, opt, sym))
-#Upper be ce and lower be pe data only
-be_legs = []
-
-for be_label, be_strike, opt in (
-    ("Upper BE", upper_strike, "CE"),
-    ("Lower BE", lower_strike, "PE")
-):
-    sym = option_map[be_strike].get(opt)
-    if sym:
-        be_legs.append((be_label, be_strike, opt, sym))
-
-# Symbols needed from the quotes API
+# --- Step 1: quotes for spot ATM-1, ATM, ATM+1 -----------------------------
 trade_symbols = []
 
 for strike in selected_strikes:
-    trade_symbols.append(
-        option_map[strike]["CE"]
-    )
-
-    trade_symbols.append(
-        option_map[strike]["PE"]
-    )
-
-trade_symbols.append(
-    option_map[upper_strike]["CE"]
-)
-
-trade_symbols.append(
-    option_map[lower_strike]["PE"]
-)
-
-if st.session_state.paper_trade is not None:
-    open_trade_symbol = st.session_state.paper_trade.get(
-        "symbol"
-    )
-
-    if (
-        open_trade_symbol
-        and open_trade_symbol not in trade_symbols
-    ):
-        trade_symbols.append(
-            open_trade_symbol
-        )
+    trade_symbols.append(option_map[strike]["CE"])
+    trade_symbols.append(option_map[strike]["PE"])
 
 try:
     quotes = fetch_option_quotes(
@@ -920,13 +890,164 @@ except Exception as e:
     )
     st.stop()
 
+# --- Step 2: synthetic future = avg(Strike + CE LTP - PE LTP) ----------------
+try:
+    syn_df, syn_fut = calculate_synthetic_future(
+        selected_strikes,
+        option_map,
+        quotes
+    )
+
+    # `atm` below = listed strike closest to the synthetic future
+    atm = find_synthetic_atm(
+        option_map,
+        syn_fut
+    )
+
+    # strikes used for Avg CE/PE Dev = Syn ATM-1, Syn ATM, Syn ATM+1
+    dev_strikes = select_three_around(
+        option_map,
+        atm
+    )
+except Exception as e:
+    st.error(str(e))
+    st.stop()
+
+# --- Step 3: straddle at that strike ------------------------------------------
+atm_ce_symbol = option_map[atm]["CE"]
+atm_pe_symbol = option_map[atm]["PE"]
+
+dev_symbols = []
+
+for strike in dev_strikes:
+    dev_symbols.append(option_map[strike]["CE"])
+    dev_symbols.append(option_map[strike]["PE"])
+
+missing_dev_symbols = [
+    sym for sym in dict.fromkeys(dev_symbols)
+    if sym not in quotes
+]
+
+if missing_dev_symbols:
+    trade_symbols.extend(missing_dev_symbols)
+
+    try:
+        quotes.update(
+            fetch_option_quotes(
+                fyers,
+                tuple(missing_dev_symbols)
+            )
+        )
+    except Exception as e:
+        st.error(
+            f"Synthetic ATM option quotes fetch failed: {e}"
+        )
+        st.stop()
+
+atm_ce_quote = quotes.get(
+    atm_ce_symbol
+)
+
+atm_pe_quote = quotes.get(
+    atm_pe_symbol
+)
+
+if not atm_ce_quote or not atm_pe_quote:
+    st.error(
+        "Synthetic ATM CE/PE quotes unavailable."
+    )
+    st.stop()
+
+atm_ce_ltp = atm_ce_quote.get("lp")
+atm_pe_ltp = atm_pe_quote.get("lp")
+
+if (
+    not valid_number(atm_ce_ltp)
+    or not valid_number(atm_pe_ltp)
+):
+    st.error(
+        f"Invalid synthetic ATM option prices: "
+        f"CE={atm_ce_ltp}, PE={atm_pe_ltp}"
+    )
+    st.stop()
+
+atm_ce_ltp = float(atm_ce_ltp)
+atm_pe_ltp = float(atm_pe_ltp)
+
+atm_straddle = (
+    atm_ce_ltp +
+    atm_pe_ltp
+)
+
+# --- Step 4: breakevens = synthetic future +/- straddle ---------------------
+try:
+    (
+        upper_breakeven,
+        lower_breakeven,
+        upper_strike,
+        lower_strike
+    ) = find_breakeven_strikes(
+        option_map,
+        syn_fut,
+        atm_straddle
+    )
+except Exception as e:
+    st.error(str(e))
+    st.stop()
+
+# Upper BE CE and lower BE PE data only
+be_legs = []
+
+for be_label, be_strike, opt in (
+    ("Upper BE", upper_strike, "CE"),
+    ("Lower BE", lower_strike, "PE")
+):
+    sym = option_map[be_strike].get(opt)
+    if sym:
+        be_legs.append((be_label, be_strike, opt, sym))
+
+# --- Step 5: quotes still needed (breakeven legs + any open paper trade) -----
+extra_symbols = [
+    option_map[upper_strike]["CE"],
+    option_map[lower_strike]["PE"]
+]
+
+if st.session_state.paper_trade is not None:
+    open_trade_symbol = st.session_state.paper_trade.get(
+        "symbol"
+    )
+
+    if open_trade_symbol:
+        extra_symbols.append(open_trade_symbol)
+
+extra_symbols = [
+    sym for sym in dict.fromkeys(extra_symbols)
+    if sym not in quotes
+]
+
+if extra_symbols:
+    trade_symbols.extend(extra_symbols)
+
+    try:
+        quotes.update(
+            fetch_option_quotes(
+                fyers,
+                tuple(extra_symbols)
+            )
+        )
+    except Exception as e:
+        st.error(
+            f"Option quotes fetch failed: {e}"
+        )
+        st.stop()
+
 try:
     (
         calculation_df,
         average_ce_deviation,
         average_pe_deviation
     ) = calculate_deviations(
-        selected_strikes,
+        dev_strikes,
         option_map,
         quotes
     )
@@ -963,6 +1084,20 @@ for be_label, be_strike, opt, sym in be_legs:
     })
 
 theta_df = pd.DataFrame(theta_rows)
+
+# CE / (CE + PE) and PE / (CE + PE) for the upper-BE CE and lower-BE PE
+be_ce_ltp = quotes.get(
+    option_map[upper_strike]["CE"], {}
+).get("lp")
+
+be_pe_ltp = quotes.get(
+    option_map[lower_strike]["PE"], {}
+).get("lp")
+
+ce_share, pe_share = premium_share(
+    be_ce_ltp,
+    be_pe_ltp
+)
 
 buy_signal = check_buy_signal(
     average_ce_deviation,
@@ -1100,7 +1235,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-m = st.columns(7)
+m = st.columns(8)
 
 m[0].metric(
     "Spot",
@@ -1108,33 +1243,60 @@ m[0].metric(
 )
 
 m[1].metric(
-    "ATM",
-    f"{atm:,.0f}"
+    "Syn Future",
+    f"{syn_fut:,.2f}"
 )
 
 m[2].metric(
-    "ATM Straddle",
-    f"{atm_straddle:,.2f}"
+    "Syn ATM",
+    f"{atm:,.0f}"
 )
 
 m[3].metric(
+    "Straddle @ Syn ATM",
+    f"{atm_straddle:,.2f}"
+)
+
+m[4].metric(
     "Upper BE Strike",
     f"{upper_strike:,.2f}"
 )
 
-m[4].metric(
+m[5].metric(
     "Lower BE Strike",
     f"{lower_strike:,.2f}"
 )
 
-m[5].metric(
+m[6].metric(
     "Avg CE Dev.",
     f"{average_ce_deviation:+,.2f}"
 )
 
-m[6].metric(
+m[7].metric(
     "Avg PE Dev.",
     f"{average_pe_deviation:+,.2f}"
+)
+
+st.subheader(
+    "Synthetic Future (Strike + CE LTP − PE LTP)"
+)
+
+st.dataframe(
+    syn_df,
+    use_container_width=True,
+    hide_index=True
+)
+
+st.write(
+    f"**Synthetic Future** (average of {len(syn_df)} strikes) = "
+    f"**{syn_fut:,.2f}**  |  Spot = {spot:,.2f}  |  "
+    f"Syn Future − Spot = {syn_fut - spot:+,.2f}"
+)
+
+st.caption(
+    "The synthetic future is averaged over the three strikes around spot ATM "
+    "(needed to locate the Syn ATM). Avg CE/PE Dev and the straddle use the "
+    "strikes around the Syn ATM."
 )
 
 st.subheader(
@@ -1144,10 +1306,11 @@ st.subheader(
 be_df = pd.DataFrame([
     {
         "Spot": spot,
-        "ATM": atm,
-        "ATM CE LTP": atm_ce_ltp,
-        "ATM PE LTP": atm_pe_ltp,
-        "ATM Straddle": atm_straddle,
+        "Synthetic Future": syn_fut,
+        "Syn ATM Strike": atm,
+        "Syn ATM CE LTP": atm_ce_ltp,
+        "Syn ATM PE LTP": atm_pe_ltp,
+        "Straddle": atm_straddle,
         "Upper Breakeven": upper_breakeven,
         "Upper BE Strike": upper_strike,
         "Lower Breakeven": lower_breakeven,
@@ -1159,6 +1322,51 @@ st.dataframe(
     be_df,
     use_container_width=True,
     hide_index=True
+)
+
+st.subheader(
+    "Premium Share at Breakeven Strikes"
+)
+
+share_df = pd.DataFrame([
+    {
+        "Upper BE Strike": upper_strike,
+        "CE LTP": be_ce_ltp,
+        "CE Dist from Syn Fut": upper_strike - syn_fut,
+        "Lower BE Strike": lower_strike,
+        "PE LTP": be_pe_ltp,
+        "PE Dist from Syn Fut": syn_fut - lower_strike,
+        "CE / (CE+PE) %": (
+            None if ce_share is None else ce_share * 100
+        ),
+        "PE / (CE+PE) %": (
+            None if pe_share is None else pe_share * 100
+        )
+    }
+])
+
+st.dataframe(
+    share_df,
+    use_container_width=True,
+    hide_index=True
+)
+
+sh = st.columns(2)
+
+sh[0].metric(
+    "CE / (CE + PE)",
+    "n/a" if ce_share is None else f"{ce_share * 100:.1f}%"
+)
+
+sh[1].metric(
+    "PE / (CE + PE)",
+    "n/a" if pe_share is None else f"{pe_share * 100:.1f}%"
+)
+
+st.caption(
+    "CE = upper breakeven strike CE LTP, PE = lower breakeven strike PE LTP. "
+    "Strikes snap to the nearest listed strike, so check the two distances "
+    "from the synthetic future before reading the gap as skew."
 )
 
 st.subheader(
@@ -1177,7 +1385,7 @@ st.caption(
 )
 
 st.subheader(
-    "CE / PE LTP − ATP"
+    "CE / PE LTP − ATP (Syn ATM−1, Syn ATM, Syn ATM+1)"
 )
 
 display_df = calculation_df[
@@ -1486,24 +1694,42 @@ with st.expander(
 
     st.latex(
         r"AvgCEDev="
-        r"\frac{CEDev_{ATM-1}+CEDev_{ATM}+CEDev_{ATM+1}}{3}"
+        r"\frac{CEDev_{SynATM-1}+CEDev_{SynATM}+CEDev_{SynATM+1}}{3}"
     )
 
     st.latex(
         r"AvgPEDev="
-        r"\frac{PEDev_{ATM-1}+PEDev_{ATM}+PEDev_{ATM+1}}{3}"
+        r"\frac{PEDev_{SynATM-1}+PEDev_{SynATM}+PEDev_{SynATM+1}}{3}"
     )
 
     st.latex(
-        r"ATM\ Straddle=ATM_{CE,LTP}+ATM_{PE,LTP}"
+        r"SynFut_{K}=K+CE_{LTP,K}-PE_{LTP,K}"
     )
 
     st.latex(
-        r"Upper\ BE=Spot+ATM\ Straddle"
+        r"SynFut=\frac{SynFut_{SpotATM-1}+SynFut_{SpotATM}+SynFut_{SpotATM+1}}{3}"
     )
 
     st.latex(
-        r"Lower\ BE=Spot-ATM\ Straddle"
+        r"Syn\ ATM=\text{listed strike closest to }SynFut"
+    )
+
+    st.latex(
+        r"Straddle=CE_{LTP,SynATM}+PE_{LTP,SynATM}"
+    )
+
+    st.latex(
+        r"Upper\ BE=SynFut+Straddle"
+    )
+
+    st.latex(
+        r"Lower\ BE=SynFut-Straddle"
+    )
+
+    st.latex(
+        r"CE\ Share=\frac{CE_{UpperBE}}{CE_{UpperBE}+PE_{LowerBE}}"
+        r",\quad "
+        r"PE\ Share=\frac{PE_{LowerBE}}{CE_{UpperBE}+PE_{LowerBE}}"
     )
 
     st.latex(
