@@ -282,18 +282,6 @@ def select_three_around(option_map, center_strike):
 
     return strikes[index - 1:index + 2]
 
-def premium_share(ce_ltp, pe_ltp):
-    """CE / (CE + PE) and PE / (CE + PE). (None, None) if not computable."""
-    if not (valid_number(ce_ltp) and valid_number(pe_ltp)):
-        return None, None
-
-    total = float(ce_ltp) + float(pe_ltp)
-
-    if total <= 0:
-        return None, None
-
-    return float(ce_ltp) / total, float(pe_ltp) / total
-
 def find_breakeven_strikes(option_map, center, straddle):
     strikes = sorted(option_map.keys())
 
@@ -1085,19 +1073,22 @@ for be_label, be_strike, opt, sym in be_legs:
 
 theta_df = pd.DataFrame(theta_rows)
 
-# CE / (CE + PE) and PE / (CE + PE) for the upper-BE CE and lower-BE PE
-be_ce_ltp = quotes.get(
-    option_map[upper_strike]["CE"], {}
-).get("lp")
+# CE / (CE + PE) and PE / (CE + PE) at Syn ATM-1, Syn ATM, Syn ATM+1
+# (same strikes and same quotes as the LTP - ATP deviations)
+share_df = calculation_df[["Strike", "CE LTP", "PE LTP"]].copy()
 
-be_pe_ltp = quotes.get(
-    option_map[lower_strike]["PE"], {}
-).get("lp")
+share_total = share_df["CE LTP"] + share_df["PE LTP"]
 
-ce_share, pe_share = premium_share(
-    be_ce_ltp,
-    be_pe_ltp
+share_df["CE / (CE+PE) %"] = (
+    share_df["CE LTP"] / share_total.where(share_total > 0) * 100
 )
+
+share_df["PE / (CE+PE) %"] = (
+    share_df["PE LTP"] / share_total.where(share_total > 0) * 100
+)
+
+avg_ce_share = float(share_df["CE / (CE+PE) %"].mean())
+avg_pe_share = float(share_df["PE / (CE+PE) %"].mean())
 
 buy_signal = check_buy_signal(
     average_ce_deviation,
@@ -1325,25 +1316,8 @@ st.dataframe(
 )
 
 st.subheader(
-    "Premium Share at Breakeven Strikes"
+    "CE / (CE + PE) at Syn ATM−1, Syn ATM, Syn ATM+1"
 )
-
-share_df = pd.DataFrame([
-    {
-        "Upper BE Strike": upper_strike,
-        "CE LTP": be_ce_ltp,
-        "CE Dist from Syn Fut": upper_strike - syn_fut,
-        "Lower BE Strike": lower_strike,
-        "PE LTP": be_pe_ltp,
-        "PE Dist from Syn Fut": syn_fut - lower_strike,
-        "CE / (CE+PE) %": (
-            None if ce_share is None else ce_share * 100
-        ),
-        "PE / (CE+PE) %": (
-            None if pe_share is None else pe_share * 100
-        )
-    }
-])
 
 st.dataframe(
     share_df,
@@ -1354,19 +1328,21 @@ st.dataframe(
 sh = st.columns(2)
 
 sh[0].metric(
-    "CE / (CE + PE)",
-    "n/a" if ce_share is None else f"{ce_share * 100:.1f}%"
+    "Avg CE / (CE + PE)",
+    "n/a" if pd.isna(avg_ce_share) else f"{avg_ce_share:.1f}%"
 )
 
 sh[1].metric(
-    "PE / (CE + PE)",
-    "n/a" if pe_share is None else f"{pe_share * 100:.1f}%"
+    "Avg PE / (CE + PE)",
+    "n/a" if pd.isna(avg_pe_share) else f"{avg_pe_share:.1f}%"
 )
 
 st.caption(
-    "CE = upper breakeven strike CE LTP, PE = lower breakeven strike PE LTP. "
-    "Strikes snap to the nearest listed strike, so check the two distances "
-    "from the synthetic future before reading the gap as skew."
+    "Share at each strike = CE LTP / (CE LTP + PE LTP) and "
+    "PE LTP / (CE LTP + PE LTP); the metrics are the simple average of the "
+    "three strikes. By put-call parity CE LTP − PE LTP = Synthetic Future − "
+    "Strike, so this ratio mostly shows where the synthetic future sits "
+    "relative to these strikes."
 )
 
 st.subheader(
@@ -1497,6 +1473,37 @@ st.write(
     f"**Average PE Dev:** "
     f"({pe_values_text}) / {len(pe_values)} = "
     f"**{average_pe_deviation:+,.2f}**"
+)
+
+for _, row in share_df.iterrows():
+    st.write(
+        f"**{row['Strike']:,.0f}** → "
+        f"CE: {row['CE LTP']:,.2f} / "
+        f"({row['CE LTP']:,.2f} + {row['PE LTP']:,.2f}) = "
+        f"**{row['CE / (CE+PE) %']:.1f}%** | "
+        f"PE: {row['PE LTP']:,.2f} / "
+        f"({row['CE LTP']:,.2f} + {row['PE LTP']:,.2f}) = "
+        f"**{row['PE / (CE+PE) %']:.1f}%**"
+    )
+
+ce_share_text = " + ".join(
+    f"{x:.1f}%" for x in share_df["CE / (CE+PE) %"].tolist()
+)
+
+pe_share_text = " + ".join(
+    f"{x:.1f}%" for x in share_df["PE / (CE+PE) %"].tolist()
+)
+
+st.write(
+    f"**Avg CE / (CE + PE):** "
+    f"({ce_share_text}) / {len(share_df)} = "
+    f"**{avg_ce_share:.1f}%**"
+)
+
+st.write(
+    f"**Avg PE / (CE + PE):** "
+    f"({pe_share_text}) / {len(share_df)} = "
+    f"**{avg_pe_share:.1f}%**"
 )
 
 st.subheader(
@@ -1727,9 +1734,19 @@ with st.expander(
     )
 
     st.latex(
-        r"CE\ Share=\frac{CE_{UpperBE}}{CE_{UpperBE}+PE_{LowerBE}}"
+        r"CE\ Share_{K}=\frac{CE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
         r",\quad "
-        r"PE\ Share=\frac{PE_{LowerBE}}{CE_{UpperBE}+PE_{LowerBE}}"
+        r"PE\ Share_{K}=\frac{PE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
+    )
+
+    st.latex(
+        r"Avg\ CE\ Share="
+        r"\frac{CEShare_{SynATM-1}+CEShare_{SynATM}+CEShare_{SynATM+1}}{3}"
+    )
+
+    st.latex(
+        r"Avg\ PE\ Share="
+        r"\frac{PEShare_{SynATM-1}+PEShare_{SynATM}+PEShare_{SynATM+1}}{3}"
     )
 
     st.latex(
