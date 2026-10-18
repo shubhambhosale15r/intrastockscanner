@@ -260,7 +260,8 @@ def theta_ratio(theta, ltp, delta):
     if not all(valid_number(x) for x in (theta, ltp, delta)):
         return None
 
-    denominator = float(ltp) * abs(float(delta))
+    # denominator = float(ltp) * abs(float(delta))
+    denominator =  abs(float(delta))
 
     if denominator == 0:
         return None
