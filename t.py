@@ -429,11 +429,16 @@ if not expiry_data:
 expiry_labels = [format_expiry(item) for item in expiry_data]
 expiry_values = [get_expiry_value(item) for item in expiry_data]
 
-expiry_index = st.sidebar.selectbox(
-    "Expiry",
-    range(len(expiry_labels)),
-    format_func=lambda i: expiry_labels[i]
-)
+# --- Expiry selector — back inside the sidebar as its own section ----------
+with st.sidebar:
+    st.divider()
+    st.subheader("Expiry")
+
+    expiry_index = st.selectbox(
+        "Expiry",
+        range(len(expiry_labels)),
+        format_func=lambda i: expiry_labels[i]
+    )
 
 selected_expiry = expiry_values[expiry_index]
 
@@ -705,7 +710,7 @@ row5[0].metric(
     "n/a" if pd.isna(avg_pe_share) else f"{avg_pe_share:.1f}%"
 )
 
-# --- Synthetic Future — Syn ATM window --------------------------------------
+# --- Synthetic Future — Syn ATM window -------------------------------------
 st.subheader(
     "Synthetic Future (Strike + CE LTP − PE LTP) — Syn ATM window"
 )
@@ -752,7 +757,9 @@ be_df = pd.DataFrame([
 st.dataframe(be_df, use_container_width=True, hide_index=True)
 
 # --- CE / (CE+PE) at Syn ATM±1 ---------------------------------------------
-st.subheader("CE / (CE + PE) & PE / (CE + PE) at Syn ATM−1, Syn ATM, Syn ATM+1")
+st.subheader(
+    "CE / (CE + PE) & PE / (CE + PE) at Syn ATM−1, Syn ATM, Syn ATM+1"
+)
 
 st.dataframe(share_df, use_container_width=True, hide_index=True)
 
@@ -824,6 +831,7 @@ st.caption(
     "strikes and are the same values shown as Avg CE Dev. / Avg PE Dev. in "
     "the top metrics."
 )
+
 # --- Calculation breakdown -------------------------------------------------
 st.subheader("Calculation")
 
@@ -879,5 +887,92 @@ st.write(
     f"**Avg PE / (CE + PE):** ({pe_share_text}) / {len(share_df)} = "
     f"**{avg_pe_share:.1f}%**"
 )
+
+# --- Raw quotes ------------------------------------------------------------
+with st.expander("Raw Quotes API Data"):
+    raw_rows = []
+    for symbol in dict.fromkeys(trade_symbols):
+        quote = quotes.get(symbol, {})
+        raw_rows.append({
+            "Symbol": symbol,
+            "LTP": quote.get("lp"),
+            "ATP": quote.get("atp"),
+            "Bid": quote.get("bid"),
+            "Ask": quote.get("ask"),
+            "Volume": quote.get("volume")
+        })
+
+    st.dataframe(
+        pd.DataFrame(raw_rows),
+        use_container_width=True,
+        hide_index=True
+    )
+
+# --- Strategy formula ------------------------------------------------------
+with st.expander("Strategy Formula"):
+    st.latex(r"CE_{dev}=CE_{LTP}-CE_{ATP}")
+    st.latex(r"PE_{dev}=PE_{LTP}-PE_{ATP}")
+    st.latex(
+        r"AvgCEDev="
+        r"\frac{CEDev_{SynATM-1}+CEDev_{SynATM}+CEDev_{SynATM+1}}{3}"
+    )
+    st.latex(
+        r"AvgPEDev="
+        r"\frac{PEDev_{SynATM-1}+PEDev_{SynATM}+PEDev_{SynATM+1}}{3}"
+    )
+    st.latex(r"SynFut_{K}=K+CE_{LTP,K}-PE_{LTP,K}")
+    st.latex(
+        r"SynFut=\frac{SynFut_{SpotATM-1}+SynFut_{SpotATM}+SynFut_{SpotATM+1}}{3}"
+    )
+    st.latex(r"Syn\ ATM=\text{listed strike closest to }SynFut")
+    st.latex(r"Straddle=CE_{LTP,SynATM}+PE_{LTP,SynATM}")
+    st.latex(r"Upper\ BE=SynFut+Straddle")
+    st.latex(r"Lower\ BE=SynFut-Straddle")
+    st.latex(
+        r"CE\ Share_{K}=\frac{CE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
+        r",\quad "
+        r"PE\ Share_{K}=\frac{PE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
+    )
+    st.latex(
+        r"Avg\ CE\ Share="
+        r"\frac{CEShare_{SynATM-1}+CEShare_{SynATM}+CEShare_{SynATM+1}}{3}"
+    )
+    st.latex(
+        r"Avg\ PE\ Share="
+        r"\frac{PEShare_{SynATM-1}+PEShare_{SynATM}+PEShare_{SynATM+1}}{3}"
+    )
+    st.latex(r"Theta\ Ratio=\frac{|\Theta|}{|\Delta|}")
+    st.latex(
+        r"Avg\ CE\ Theta\ Ratio="
+        r"\frac{1}{3}\sum_{K\in\{SynATM-1,SynATM,SynATM+1\}}"
+        r"\frac{|\Theta_{CE,K}|}{|\Delta_{CE,K}|}"
+    )
+    st.latex(
+        r"Avg\ PE\ Theta\ Ratio="
+        r"\frac{1}{3}\sum_{K\in\{SynATM-1,SynATM,SynATM+1\}}"
+        r"\frac{|\Theta_{PE,K}|}{|\Delta_{PE,K}|}"
+    )
+
+    st.write(
+        "Buy signal: Avg CE Dev > 0, Avg PE Dev < 0, "
+        "and abs(Avg PE Dev) > 1.5 × abs(Avg CE Dev)."
+    )
+    st.write(
+        "Buy signal suggests shorting the PE at the strike closest to the "
+        "Lower BE."
+    )
+    st.write(
+        "Sell signal: Avg PE Dev > 0, Avg CE Dev < 0, "
+        "and abs(Avg CE Dev) > 1.5 × abs(Avg PE Dev)."
+    )
+    st.write(
+        "Sell signal suggests shorting the CE at the strike closest to the "
+        "Upper BE."
+    )
+    st.write(
+        "All values are informational signals only. No orders are sent to "
+        "Fyers."
+    )
+
 if st.button("Manual Refresh"):
     st.rerun()
