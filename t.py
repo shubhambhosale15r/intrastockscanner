@@ -250,37 +250,58 @@ def calculate_synthetic_future(selected_strikes, option_map, quotes):
 
     return df, float(df["Synthetic Future"].mean())
 
-def find_synthetic_atm(option_map, syn_fut):
-    """Listed strike (with both CE and PE) closest to the synthetic future."""
-    candidates = sorted(
+def both_leg_strikes(option_map):
+    """Sorted strikes where both CE and PE are available."""
+    return sorted(
         strike for strike, legs in option_map.items()
         if "CE" in legs and "PE" in legs
     )
+
+def find_closest_strike(option_map, price):
+    """Listed strike (with both CE and PE) closest to `price`."""
+    candidates = both_leg_strikes(option_map)
 
     if not candidates:
         raise RuntimeError(
-            "No strike with both CE and PE available for synthetic ATM."
+            "No strike with both CE and PE available."
         )
 
-    return min(candidates, key=lambda strike: abs(strike - syn_fut))
+    return min(candidates, key=lambda strike: abs(strike - price))
 
 def select_three_around(option_map, center_strike):
-    """Listed strikes (both CE and PE available) just below, at and just
-    above center_strike."""
-    strikes = sorted(
-        strike for strike, legs in option_map.items()
-        if "CE" in legs and "PE" in legs
-    )
+    """Three listed strikes (both CE and PE available) around center_strike.
 
-    index = strikes.index(center_strike)
+    Returns (strikes, note). note is None when the window is centred on
+    center_strike with adjacent strikes, otherwise a short explanation
+    (chain edge reached, or a CE/PE missing between neighbouring strikes)."""
+    strikes = both_leg_strikes(option_map)
 
-    if index == 0 or index == len(strikes) - 1:
+    if len(strikes) < 3:
         raise RuntimeError(
-            "Unable to select Syn ATM-1, Syn ATM and Syn ATM+1 "
-            "from the available strikes."
+            "Fewer than 3 strikes with both CE and PE are available."
         )
 
-    return strikes[index - 1:index + 2]
+    index = strikes.index(center_strike)
+    start = min(max(index - 1, 0), len(strikes) - 3)
+    window = strikes[start:start + 3]
+
+    step = min(b - a for a, b in zip(strikes, strikes[1:]))
+    notes = []
+
+    if window[1] != center_strike:
+        notes.append(
+            f"{center_strike:,.0f} is at the edge of the loaded chain, so "
+            f"the window {[int(x) for x in window]} is not centred on it. "
+            f"Increase Strike Count."
+        )
+
+    if max(b - a for a, b in zip(window, window[1:])) > step:
+        notes.append(
+            f"Strikes {[int(x) for x in window]} are not adjacent "
+            f"(a CE or PE is missing in between)."
+        )
+
+    return window, (" ".join(notes) if notes else None)
 
 def find_breakeven_strikes(option_map, center, straddle):
     strikes = sorted(option_map.keys())
@@ -851,11 +872,35 @@ option_map = build_option_map(
     chain_rows
 )
 
+window_warnings = []
+
+strike_list = both_leg_strikes(option_map)
+
+if len(strike_list) < 3:
+    st.error(
+        "Fewer than 3 strikes with both CE and PE in the option chain."
+    )
+    st.stop()
+
+strike_step = min(
+    b_ - a_ for a_, b_ in zip(strike_list, strike_list[1:])
+)
+
 try:
-    selected_strikes, spot_atm = select_three_strikes(
+    spot_atm = find_closest_strike(
         option_map,
         spot
     )
+
+    selected_strikes, spot_note = select_three_around(
+        option_map,
+        spot_atm
+    )
+
+    if spot_note:
+        window_warnings.append(
+            f"Spot ATM window: {spot_note}"
+        )
 except Exception as e:
     st.error(str(e))
     st.stop()
@@ -887,16 +932,21 @@ try:
     )
 
     # `atm` below = listed strike closest to the synthetic future
-    atm = find_synthetic_atm(
+    atm = find_closest_strike(
         option_map,
         syn_fut
     )
 
     # strikes used for Avg CE/PE Dev = Syn ATM-1, Syn ATM, Syn ATM+1
-    dev_strikes = select_three_around(
+    dev_strikes, syn_note = select_three_around(
         option_map,
         atm
     )
+
+    if syn_note:
+        window_warnings.append(
+            f"Syn ATM window: {syn_note}"
+        )
 except Exception as e:
     st.error(str(e))
     st.stop()
@@ -982,6 +1032,18 @@ try:
 except Exception as e:
     st.error(str(e))
     st.stop()
+
+if abs(upper_strike - upper_breakeven) > strike_step:
+    window_warnings.append(
+        f"Upper breakeven {upper_breakeven:,.0f} is outside the loaded chain "
+        f"(nearest listed strike {upper_strike:,.0f}). Increase Strike Count."
+    )
+
+if abs(lower_strike - lower_breakeven) > strike_step:
+    window_warnings.append(
+        f"Lower breakeven {lower_breakeven:,.0f} is outside the loaded chain "
+        f"(nearest listed strike {lower_strike:,.0f}). Increase Strike Count."
+    )
 
 # Upper BE CE and lower BE PE data only
 be_legs = []
@@ -1226,6 +1288,9 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+for warning_text in window_warnings:
+    st.warning(warning_text)
+
 m = st.columns(8)
 
 m[0].metric(
@@ -1288,6 +1353,12 @@ st.caption(
     "The synthetic future is averaged over the three strikes around spot ATM "
     "(needed to locate the Syn ATM). Avg CE/PE Dev and the straddle use the "
     "strikes around the Syn ATM."
+)
+
+st.caption(
+    f"Syn Future is {syn_fut - atm:+,.1f} pts from Syn ATM {atm:,.0f}. "
+    f"The Syn ATM (and the strikes used) switches to the next strike once "
+    f"this passes ±{strike_step / 2:,.1f} pts (strike step {strike_step:,.0f})."
 )
 
 st.subheader(
