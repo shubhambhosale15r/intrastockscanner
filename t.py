@@ -161,8 +161,6 @@ def build_option_map(chain):
     return option_map
 
 def build_greeks_map(chain):
-    """LTP, delta and theta all taken from the same chain row,
-    so they always belong to the same snapshot."""
     greeks_map = {}
 
     for row in chain:
@@ -180,38 +178,7 @@ def build_greeks_map(chain):
 
     return greeks_map
 
-def select_three_strikes(option_map, spot):
-    strikes = sorted(option_map.keys())
-
-    if not strikes:
-        raise RuntimeError("No option strikes found in option chain.")
-
-    atm_index = min(
-        range(len(strikes)),
-        key=lambda i: abs(strikes[i] - spot)
-    )
-
-    if atm_index == 0 or atm_index == len(strikes) - 1:
-        raise RuntimeError(
-            "Unable to select ATM-1, ATM and ATM+1 from the available strikes."
-        )
-
-    selected = strikes[atm_index - 1:atm_index + 2]
-
-    for strike in selected:
-        if (
-            "CE" not in option_map[strike]
-            or "PE" not in option_map[strike]
-        ):
-            raise RuntimeError(
-                f"Both CE and PE are not available for strike {strike}."
-            )
-
-    return selected, strikes[atm_index]
-
 def calculate_synthetic_future(selected_strikes, option_map, quotes):
-    """Synthetic future per strike = Strike + CE LTP - PE LTP.
-    Returns a per-strike table and the average of the synthetic futures."""
     rows = []
 
     for strike in selected_strikes:
@@ -269,11 +236,11 @@ def find_closest_strike(option_map, price):
     return min(candidates, key=lambda strike: abs(strike - price))
 
 def select_three_around(option_map, center_strike):
-    """Three listed strikes (both CE and PE available) around center_strike.
+    """Strictly return the 3 adjacent both-leg strikes centred on center_strike.
 
-    Returns (strikes, note). note is None when the window is centred on
-    center_strike with adjacent strikes, otherwise a short explanation
-    (chain edge reached, or a CE/PE missing between neighbouring strikes)."""
+    Raises if the centre is at the edge of the loaded chain, if it's not in
+    the both-leg universe, or if the two neighbours are not adjacent strikes
+    (a CE or PE is missing between them)."""
     strikes = both_leg_strikes(option_map)
 
     if len(strikes) < 3:
@@ -281,30 +248,37 @@ def select_three_around(option_map, center_strike):
             "Fewer than 3 strikes with both CE and PE are available."
         )
 
-    index = strikes.index(center_strike)
-    start = min(max(index - 1, 0), len(strikes) - 3)
-    window = strikes[start:start + 3]
-
-    step = min(b - a for a, b in zip(strikes, strikes[1:]))
-    notes = []
-
-    if window[1] != center_strike:
-        notes.append(
-            f"{center_strike:,.0f} is at the edge of the loaded chain, so "
-            f"the window {[int(x) for x in window]} is not centred on it. "
+    if center_strike not in strikes:
+        raise RuntimeError(
+            f"Centre strike {center_strike:,.0f} is not in the loaded chain "
+            f"(both-leg strikes: {int(strikes[0]):,}–{int(strikes[-1]):,}). "
             f"Increase Strike Count."
         )
 
-    if max(b - a for a, b in zip(window, window[1:])) > step:
-        notes.append(
-            f"Strikes {[int(x) for x in window]} are not adjacent "
-            f"(a CE or PE is missing in between)."
+    index = strikes.index(center_strike)
+
+    if index == 0 or index == len(strikes) - 1:
+        raise RuntimeError(
+            f"{center_strike:,.0f} is at the edge of the loaded chain, so it "
+            f"cannot be the centre of a Syn ATM−1 / Syn ATM / Syn ATM+1 "
+            f"window (loaded range {int(strikes[0]):,}–{int(strikes[-1]):,}). "
+            f"Increase Strike Count in the sidebar."
         )
 
-    return window, (" ".join(notes) if notes else None)
+    window = strikes[index - 1:index + 2]
+    step = min(b - a for a, b in zip(strikes, strikes[1:]))
+
+    if max(b - a for a, b in zip(window, window[1:])) > step:
+        raise RuntimeError(
+            f"Strikes {[int(x) for x in window]} are not adjacent "
+            f"(a CE or PE is missing in between). Increase Strike Count."
+        )
+
+    return window, None
 
 def find_breakeven_strikes(option_map, center, straddle):
-    strikes = sorted(option_map.keys())
+    # FIX: use the same both-leg universe as everything else.
+    strikes = both_leg_strikes(option_map)
 
     if not strikes:
         raise RuntimeError(
@@ -354,8 +328,9 @@ def theta_ratio(theta, ltp, delta):
     if not all(valid_number(x) for x in (theta, ltp, delta)):
         return None
 
-    # denominator = float(ltp) * abs(float(delta))
-    denominator =  abs(float(delta))
+    # Note: LTP is intentionally not in the denominator here,
+    # matching the existing behaviour of the strategy.
+    denominator = abs(float(delta))
 
     if denominator == 0:
         return None
@@ -446,12 +421,6 @@ def format_ist_time(dt):
     )
 
 def ms_until_next_boundary(step_seconds, buffer_ms=300):
-    """Milliseconds until the next wall-clock multiple of step_seconds,
-    measured from IST midnight. Examples:
-      15s -> :00, :15, :30, :45 of every minute
-      60s -> top of every minute (10:00, 10:01, 10:02 ...)
-    A small buffer makes the rerun land just after the boundary so the
-    fresh candle/quote data is already available."""
     step_ms = max(int(step_seconds), 1) * 1000
 
     now = get_ist_time()
@@ -886,21 +855,17 @@ strike_step = min(
     b_ - a_ for a_, b_ in zip(strike_list, strike_list[1:])
 )
 
+# --- Step 0: spot ATM window (bootstrap for synthetic future) ---------------
 try:
     spot_atm = find_closest_strike(
         option_map,
         spot
     )
 
-    selected_strikes, spot_note = select_three_around(
+    selected_strikes, _ = select_three_around(
         option_map,
         spot_atm
     )
-
-    if spot_note:
-        window_warnings.append(
-            f"Spot ATM window: {spot_note}"
-        )
 except Exception as e:
     st.error(str(e))
     st.stop()
@@ -923,7 +888,7 @@ except Exception as e:
     )
     st.stop()
 
-# --- Step 2: synthetic future = avg(Strike + CE LTP - PE LTP) ----------------
+# --- Step 2: synthetic future = avg(Strike + CE LTP - PE LTP) --------------
 try:
     syn_df, syn_fut = calculate_synthetic_future(
         selected_strikes,
@@ -931,27 +896,23 @@ try:
         quotes
     )
 
-    # `atm` below = listed strike closest to the synthetic future
+    # Syn ATM = listed strike closest to the synthetic future
     atm = find_closest_strike(
         option_map,
         syn_fut
     )
 
-    # strikes used for Avg CE/PE Dev = Syn ATM-1, Syn ATM, Syn ATM+1
-    dev_strikes, syn_note = select_three_around(
+    # Deviation window = Syn ATM−1, Syn ATM, Syn ATM+1
+    # Strict: must be centred and adjacent, otherwise raises.
+    dev_strikes, _ = select_three_around(
         option_map,
         atm
     )
-
-    if syn_note:
-        window_warnings.append(
-            f"Syn ATM window: {syn_note}"
-        )
 except Exception as e:
     st.error(str(e))
     st.stop()
 
-# --- Step 3: straddle at that strike ------------------------------------------
+# --- Step 3: straddle at Syn ATM -------------------------------------------
 atm_ce_symbol = option_map[atm]["CE"]
 atm_pe_symbol = option_map[atm]["PE"]
 
@@ -1017,7 +978,7 @@ atm_straddle = (
     atm_pe_ltp
 )
 
-# --- Step 4: breakevens = synthetic future +/- straddle ---------------------
+# --- Step 4: breakevens = synthetic future +/- straddle --------------------
 try:
     (
         upper_breakeven,
@@ -1056,7 +1017,7 @@ for be_label, be_strike, opt in (
     if sym:
         be_legs.append((be_label, be_strike, opt, sym))
 
-# --- Step 5: quotes still needed (breakeven legs + any open paper trade) -----
+# --- Step 5: quotes still needed (breakeven legs + any open paper trade) ---
 extra_symbols = [
     option_map[upper_strike]["CE"],
     option_map[lower_strike]["PE"]
@@ -1136,7 +1097,6 @@ for be_label, be_strike, opt, sym in be_legs:
 theta_df = pd.DataFrame(theta_rows)
 
 # CE / (CE + PE) and PE / (CE + PE) at Syn ATM-1, Syn ATM, Syn ATM+1
-# (same strikes and same quotes as the LTP - ATP deviations)
 share_df = calculation_df[["Strike", "CE LTP", "PE LTP"]].copy()
 
 share_total = share_df["CE LTP"] + share_df["PE LTP"]
@@ -1275,12 +1235,9 @@ else:
 st.markdown(
     """
     <style>
-    /* Change the font size of the metric number/value */
     [data-testid="stMetricValue"] {
         font-size: 20px !important;
     }
-
-    /* Change the font size of the metric top label */
     [data-testid="stMetricLabel"] p {
         font-size: 14px !important;
     }
@@ -1288,8 +1245,16 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 for warning_text in window_warnings:
     st.warning(warning_text)
+
+# --- Loaded chain transparency ---------------------------------------------
+st.caption(
+    f"Loaded both-leg strikes: "
+    f"{int(strike_list[0]):,}–{int(strike_list[-1]):,} "
+    f"({len(strike_list)} strikes, step {int(strike_step)})"
+)
 
 m = st.columns(8)
 
@@ -1334,7 +1299,7 @@ m[7].metric(
 )
 
 st.subheader(
-    "Synthetic Future (Strike + CE LTP − PE LTP)"
+    "Synthetic Future (Strike + CE LTP − PE LTP) — Spot ATM window"
 )
 
 st.dataframe(
@@ -1350,9 +1315,10 @@ st.write(
 )
 
 st.caption(
-    "The synthetic future is averaged over the three strikes around spot ATM "
-    "(needed to locate the Syn ATM). Avg CE/PE Dev and the straddle use the "
-    "strikes around the Syn ATM."
+    f"These three strikes are the window around the **spot ATM "
+    f"({int(spot_atm):,})**, which is the minimum set needed to compute the "
+    f"synthetic future. It is deliberately different from the Syn ATM window "
+    f"shown further below."
 )
 
 st.caption(
@@ -1411,9 +1377,7 @@ sh[1].metric(
 st.caption(
     "Share at each strike = CE LTP / (CE LTP + PE LTP) and "
     "PE LTP / (CE LTP + PE LTP); the metrics are the simple average of the "
-    "three strikes. By put-call parity CE LTP − PE LTP = Synthetic Future − "
-    "Strike, so this ratio mostly shows where the synthetic future sits "
-    "relative to these strikes."
+    "three strikes."
 )
 
 st.subheader(
@@ -1435,6 +1399,14 @@ st.subheader(
     "CE / PE LTP − ATP (Syn ATM−1, Syn ATM, Syn ATM+1)"
 )
 
+# FIX: label the three strikes so you can visually confirm which window
+# the deviation signal actually used.
+role_map = {
+    dev_strikes[0]: "Syn ATM−1",
+    dev_strikes[1]: "Syn ATM",
+    dev_strikes[2]: "Syn ATM+1",
+}
+
 display_df = calculation_df[
     [
         "Strike",
@@ -1446,6 +1418,10 @@ display_df = calculation_df[
         "PE LTP-ATP"
     ]
 ].copy()
+
+display_df.insert(
+    0, "Role", display_df["Strike"].map(role_map)
+)
 
 st.dataframe(
     display_df,
@@ -1762,105 +1738,59 @@ with st.expander(
 with st.expander(
     "Strategy Formula"
 ):
-    st.latex(
-        r"CE_{dev}=CE_{LTP}-CE_{ATP}"
-    )
-
-    st.latex(
-        r"PE_{dev}=PE_{LTP}-PE_{ATP}"
-    )
-
+    st.latex(r"CE_{dev}=CE_{LTP}-CE_{ATP}")
+    st.latex(r"PE_{dev}=PE_{LTP}-PE_{ATP}")
     st.latex(
         r"AvgCEDev="
         r"\frac{CEDev_{SynATM-1}+CEDev_{SynATM}+CEDev_{SynATM+1}}{3}"
     )
-
     st.latex(
         r"AvgPEDev="
         r"\frac{PEDev_{SynATM-1}+PEDev_{SynATM}+PEDev_{SynATM+1}}{3}"
     )
-
-    st.latex(
-        r"SynFut_{K}=K+CE_{LTP,K}-PE_{LTP,K}"
-    )
-
+    st.latex(r"SynFut_{K}=K+CE_{LTP,K}-PE_{LTP,K}")
     st.latex(
         r"SynFut=\frac{SynFut_{SpotATM-1}+SynFut_{SpotATM}+SynFut_{SpotATM+1}}{3}"
     )
-
-    st.latex(
-        r"Syn\ ATM=\text{listed strike closest to }SynFut"
-    )
-
-    st.latex(
-        r"Straddle=CE_{LTP,SynATM}+PE_{LTP,SynATM}"
-    )
-
-    st.latex(
-        r"Upper\ BE=SynFut+Straddle"
-    )
-
-    st.latex(
-        r"Lower\ BE=SynFut-Straddle"
-    )
-
+    st.latex(r"Syn\ ATM=\text{listed strike closest to }SynFut")
+    st.latex(r"Straddle=CE_{LTP,SynATM}+PE_{LTP,SynATM}")
+    st.latex(r"Upper\ BE=SynFut+Straddle")
+    st.latex(r"Lower\ BE=SynFut-Straddle")
     st.latex(
         r"CE\ Share_{K}=\frac{CE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
         r",\quad "
         r"PE\ Share_{K}=\frac{PE_{LTP,K}}{CE_{LTP,K}+PE_{LTP,K}}"
     )
-
     st.latex(
         r"Avg\ CE\ Share="
         r"\frac{CEShare_{SynATM-1}+CEShare_{SynATM}+CEShare_{SynATM+1}}{3}"
     )
-
     st.latex(
         r"Avg\ PE\ Share="
         r"\frac{PEShare_{SynATM-1}+PEShare_{SynATM}+PEShare_{SynATM+1}}{3}"
     )
-
-    st.latex(
-        r"Theta\ Ratio=\frac{|\Theta|}{LTP\times|\Delta|}"
-    )
+    st.latex(r"Theta\ Ratio=\frac{|\Theta|}{LTP\times|\Delta|}")
 
     st.write(
         "Buy signal: Avg CE Dev > 0, Avg PE Dev < 0, "
         "and abs(Avg PE Dev) > 1.5 × abs(Avg CE Dev)."
     )
-
     st.write(
         "Buy signal: SELL the selected number of lots "
         "of the PE at the strike closest to the Lower BE."
     )
-
     st.write(
         "Sell signal: Avg PE Dev > 0, Avg CE Dev < 0, "
         "and abs(Avg CE Dev) > 1.5 × abs(Avg PE Dev)."
     )
-
     st.write(
         "Sell signal: SELL the selected number of lots "
         "of the CE at the strike closest to the Upper BE."
     )
+    st.write("Short PE exit: abs(Avg CE Dev) >= abs(Avg PE Dev).")
+    st.write("Short CE exit: abs(Avg PE Dev) >= abs(Avg CE Dev).")
+    st.write("Lot size: 65 quantity per lot.")
+    st.write("All trades are paper trades. No orders are sent to Fyers.")
 
-    st.write(
-        "Short PE exit: abs(Avg CE Dev) >= abs(Avg PE Dev)."
-    )
-
-    st.write(
-        "Short CE exit: abs(Avg PE Dev) >= abs(Avg CE Dev)."
-    )
-
-    st.write(
-        "Lot size: 65 quantity per lot."
-    )
-
-    st.write(
-        "All trades are paper trades. No orders are sent to Fyers."
-    )
-
-if st.button(
-    "Manual Refresh"
-):
+if st.button("Manual Refresh"):
     st.rerun()
