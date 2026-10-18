@@ -647,10 +647,10 @@ st.markdown(
     """
     <style>
     [data-testid="stMetricValue"] {
-        font-size: 20px !important;
+        font-size: 22px !important;
     }
     [data-testid="stMetricLabel"] p {
-        font-size: 14px !important;
+        font-size: 13px !important;
     }
     </style>
     """,
@@ -666,17 +666,21 @@ st.caption(
     f"({len(strike_list)} strikes, step {int(strike_step)})"
 )
 
-m = st.columns(9)
+# --- Metrics in a 3×3 grid so all labels fit -------------------------------
+row1 = st.columns(3)
+row1[0].metric("Spot", f"{spot:,.2f}")
+row1[1].metric("Syn Future", f"{syn_fut:,.2f}")
+row1[2].metric("Syn Fut @ Syn ATM", f"{syn_fut_final:,.2f}")
 
-m[0].metric("Spot", f"{spot:,.2f}")
-m[1].metric("Syn Future", f"{syn_fut:,.2f}")
-m[2].metric("Syn Fut @ Syn ATM", f"{syn_fut_final:,.2f}")
-m[3].metric("Syn ATM", f"{atm:,.0f}")
-m[4].metric("Straddle @ Syn ATM", f"{atm_straddle:,.2f}")
-m[5].metric("Upper BE Strike", f"{upper_strike:,.2f}")
-m[6].metric("Lower BE Strike", f"{lower_strike:,.2f}")
-m[7].metric("Avg CE Dev.", f"{average_ce_deviation:+,.2f}")
-m[8].metric("Avg PE Dev.", f"{average_pe_deviation:+,.2f}")
+row2 = st.columns(3)
+row2[0].metric("Syn ATM", f"{atm:,.0f}")
+row2[1].metric("Straddle @ Syn ATM", f"{atm_straddle:,.2f}")
+row2[2].metric("Upper BE Strike", f"{upper_strike:,.2f}")
+
+row3 = st.columns(3)
+row3[0].metric("Lower BE Strike", f"{lower_strike:,.2f}")
+row3[1].metric("Avg CE Dev.", f"{average_ce_deviation:+,.2f}")
+row3[2].metric("Avg PE Dev.", f"{average_pe_deviation:+,.2f}")
 
 # --- Synthetic Future — Syn ATM window --------------------------------------
 st.subheader(
