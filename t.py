@@ -157,21 +157,34 @@ def otm_windows(strikes, syn_fut, straddle):
     }
 
 
-def deviation_table(strikes, leg, option_map, quotes):
-    """LTP - ATP for one leg across the given strikes."""
+def deviation_table(strikes, leg, option_map, quotes, center, bandwidth):
+    """(LTP - ATP) / ATP in percent per strike, plus a distance weight.
+
+    weight ~ exp(-((K - center) / bandwidth)^2), normalised to sum to 1, so strikes
+    near the forward count more and far strikes fade out smoothly."""
+    if bandwidth <= 0:
+        raise RuntimeError("Straddle is zero or negative; cannot weight strikes.")
     rows = []
     for k in strikes:
         symbol = option_map[k][leg]
         q = quotes.get(symbol)
-        if not q or not (is_num(q["lp"]) and is_num(q["atp"])):
+        if not q or not (is_num(q["lp"]) and is_num(q["atp"])) or float(q["atp"]) <= 0:
             raise RuntimeError(f"Invalid LTP/ATP for {symbol}")
+        lp, atp = float(q["lp"]), float(q["atp"])
         rows.append({
             "Strike": k,
-            f"{leg} LTP": float(q["lp"]),
-            f"{leg} ATP": float(q["atp"]),
-            f"{leg} LTP-ATP": float(q["lp"]) - float(q["atp"]),
+            f"{leg} LTP": lp,
+            f"{leg} ATP": atp,
+            f"{leg} Dev %": (lp - atp) / atp * 100,
+            f"{leg} Weight": math.exp(-(((k - center) / bandwidth) ** 2)),
         })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    df[f"{leg} Weight"] /= df[f"{leg} Weight"].sum()
+    return df
+
+
+def weighted_avg(df, leg):
+    return float((df[f"{leg} Dev %"] * df[f"{leg} Weight"]).sum())
 
 
 def compute(fyers, underlying, strikecount, expiry):
@@ -209,8 +222,10 @@ def compute(fyers, underlying, strikecount, expiry):
     )
     quotes.update(fetch_quotes(fyers, [s for s in otm_symbols if s not in quotes]))
 
-    ce_df = deviation_table(win["ce_strikes"], "CE", option_map, quotes)
-    pe_df = deviation_table(win["pe_strikes"], "PE", option_map, quotes)
+    # Weights are anchored on the continuous Syn Fut (not the rounded Syn ATM strike)
+    # so they don't jump when the ATM strike flips; bandwidth = straddle (expected move).
+    ce_df = deviation_table(win["ce_strikes"], "CE", option_map, quotes, syn_fut, straddle)
+    pe_df = deviation_table(win["pe_strikes"], "PE", option_map, quotes, syn_fut, straddle)
 
     return {
         "spot": spot,
@@ -219,8 +234,8 @@ def compute(fyers, underlying, strikecount, expiry):
         "win": win,
         "ce_df": ce_df,
         "pe_df": pe_df,
-        "avg_ce": float(ce_df["CE LTP-ATP"].mean()),
-        "avg_pe": float(pe_df["PE LTP-ATP"].mean()),
+        "avg_ce": weighted_avg(ce_df, "CE"),
+        "avg_pe": weighted_avg(pe_df, "PE"),
         "quotes": quotes,
         "strike_range": (strikes[0], strikes[-1], len(strikes), step),
     }
@@ -238,14 +253,16 @@ def ms_until_next_boundary(step_seconds, buffer_ms=300):
 
 
 def render_calculation(df, leg, avg):
-    st.write(f"**OTM {leg} Strikes ({leg} LTP − {leg} ATP):**")
+    st.write(f"**OTM {leg} Strikes (({leg} LTP − {leg} ATP) / {leg} ATP):**")
     for _, r in df.iterrows():
+        ltp_, atp_ = r[f"{leg} LTP"], r[f"{leg} ATP"]
+        dev, w = r[f"{leg} Dev %"], r[f"{leg} Weight"]
         st.write(
-            f"{r['Strike']:,.0f}: {r[f'{leg} LTP']:,.2f} − {r[f'{leg} ATP']:,.2f} "
-            f"= **{r[f'{leg} LTP-ATP']:+,.2f}**"
+            f"{r['Strike']:,.0f}: ({ltp_:,.2f} − {atp_:,.2f}) / {atp_:,.2f} = {dev:+,.2f}%  "
+            f"× weight {w:.1%} = **{dev * w:+,.2f}%**"
         )
-    terms = " + ".join(f"({x:+,.2f})" for x in df[f"{leg} LTP-ATP"])
-    st.write(f"**Avg {leg} Dev:** ({terms}) / {len(df)} = **{avg:+,.2f}**")
+    terms = " + ".join(f"({d * w:+,.2f}%)" for d, w in zip(df[f"{leg} Dev %"], df[f"{leg} Weight"]))
+    st.write(f"**Weighted Avg {leg} Dev:** {terms} = **{avg:+,.2f}%**")
 
 
 def render(r):
@@ -273,8 +290,8 @@ def render(r):
     m[1].metric("Upper BE Strike", f"{w['upper']:,.0f}")
     m[2].metric("Lower BE Strike", f"{w['lower']:,.0f}")
     m = st.columns(3)
-    m[0].metric("Avg CE Dev.", f"{r['avg_ce']:+,.2f}")
-    m[1].metric("Avg PE Dev.", f"{r['avg_pe']:+,.2f}")
+    m[0].metric("Wtd Avg CE Dev. %", f"{r['avg_ce']:+,.2f}%")
+    m[1].metric("Wtd Avg PE Dev. %", f"{r['avg_pe']:+,.2f}%")
     m[2].metric("OTM Strikes / Side", str(w["n"]))
 
     st.caption(
@@ -282,10 +299,11 @@ def render(r):
         f"**OTM PE** ({len(w['pe_strikes'])}): {[int(s) for s in w['pe_strikes']]}"
     )
 
-    st.subheader("CE / PE LTP − ATP at OTM Strikes")
+    st.subheader("CE / PE (LTP − ATP) / ATP at OTM Strikes")
     left, right = st.columns(2)
-    left.dataframe(r["ce_df"], use_container_width=True, hide_index=True)
-    right.dataframe(r["pe_df"], use_container_width=True, hide_index=True)
+    pct = lambda leg: {f"{leg} Dev %": "{:+.2f}%", f"{leg} Weight": "{:.1%}"}
+    left.dataframe(r["ce_df"].style.format(pct("CE")), use_container_width=True, hide_index=True)
+    right.dataframe(r["pe_df"].style.format(pct("PE")), use_container_width=True, hide_index=True)
 
     st.subheader("Calculation")
     render_calculation(r["ce_df"], "CE", r["avg_ce"])
@@ -299,11 +317,12 @@ def render(r):
         st.dataframe(raw, use_container_width=True, hide_index=True)
 
     with st.expander("Strategy Formula"):
-        st.latex(r"Dev_{K}=LTP_{K}-ATP_{K}")
+        st.latex(r"Dev_{K}=\frac{LTP_{K}-ATP_{K}}{ATP_{K}}\times 100")
         st.latex(r"SynFut=\frac{1}{3}\sum_{K\in SpotATM\pm1}\left(K+CE_{LTP,K}-PE_{LTP,K}\right)")
         st.latex(r"Straddle=CE_{LTP,SynATM}+PE_{LTP,SynATM}")
         st.latex(r"BE_{\pm}=SynFut\pm Straddle")
-        st.latex(r"AvgCEDev=\frac{1}{N}\sum_{K\in OTM\ CE}Dev^{CE}_{K},\quad AvgPEDev=\frac{1}{N}\sum_{K\in OTM\ PE}Dev^{PE}_{K}")
+        st.latex(r"w_{K}=\frac{e^{-((K-SynFut)/Straddle)^{2}}}{\sum_{J}e^{-((J-SynFut)/Straddle)^{2}}}")
+        st.latex(r"AvgCEDev=\sum_{K\in OTM\ CE}w_{K}\,Dev^{CE}_{K},\quad AvgPEDev=\sum_{K\in OTM\ PE}w_{K}\,Dev^{PE}_{K}")
         st.write(
             "OTM CE = both-leg strikes above Syn ATM up to the upper breakeven; OTM PE = strikes "
             "below Syn ATM down to the lower breakeven. If the counts differ, the shorter side is "
