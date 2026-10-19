@@ -289,7 +289,7 @@ def render(r):
     m[0].metric("Straddle @ Syn ATM", f"{r['straddle']:,.2f}")
     m[1].metric("Upper BE Strike", f"{w['upper']:,.0f}")
     m[2].metric("Lower BE Strike", f"{w['lower']:,.0f}")
-    m = st.columns(3)
+    m = st.columns(4)
     m[0].metric("Wtd Avg CE Dev. %", f"{r['avg_ce']:+,.2f}%")
     m[1].metric("Wtd Avg PE Dev. %", f"{r['avg_pe']:+,.2f}%")
     m[2].metric("OTM Strikes / Side", str(w["n"]))
