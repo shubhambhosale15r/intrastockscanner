@@ -293,8 +293,7 @@ def render(r):
     m[0].metric("Wtd Avg CE Dev. %", f"{r['avg_ce']:+,.2f}%")
     m[1].metric("Wtd Avg PE Dev. %", f"{r['avg_pe']:+,.2f}%")
     m[2].metric("OTM Strikes / Side", str(w["n"]))
-    m[3].metric( "avg_ce - avg_pe" , f"{(avg_ce - avg_pe):+,.2f}%")
-
+    m[3].metric( "abs(r['avg_ce']/r['avg_pe'])" , f"{abs(r['avg_ce']/ r['avg_pe']):+,.2f}")
     st.caption(
         f"**OTM CE** ({len(w['ce_strikes'])}): {[int(s) for s in w['ce_strikes']]}  ·  "
         f"**OTM PE** ({len(w['pe_strikes'])}): {[int(s) for s in w['pe_strikes']]}"
