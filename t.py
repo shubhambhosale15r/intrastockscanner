@@ -823,18 +823,19 @@ def main():
             underlying,
             strikecount,
         )
-
-        if (
-            expiry_response.get("s") == "error"
-            or expiry_response.get("code", 200) != 200
-        ):
-            raise RuntimeError(
-                f"Expiry request failed: {expiry_response}"
-            )
-
+        
+        # Fyers may return expiryData even when the initial request
+        # reports "Please provide valid expiry".
+        # Use the returned expiry list if it is available.
         expiries = (
             expiry_response.get("data", {}).get("expiryData", [])
         )
+        
+        if not expiries:
+            raise RuntimeError(
+                f"No expiry data returned by Fyers: {expiry_response}"
+            )
+        
 
         if not expiries:
             raise RuntimeError(
