@@ -1,23 +1,138 @@
-
-"""NIFTY OTM CE/PE LTP - ATP + OI/PCR signal (Fyers + Streamlit).
+"""NIFTY OTM CE/PE LTP - ATP + OI/PCR signal (Fyers WebSocket + Streamlit).
 Display only, no orders.
 """
 
 import math
+import threading
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 from fyers_apiv3 import fyersModel
+from fyers_apiv3.FyersWebsocket import data_ws
 from streamlit_autorefresh import st_autorefresh
 
 IST = ZoneInfo("Asia/Kolkata")
-QUOTE_BATCH = 50  # Fyers quotes API symbol limit per call
 
 
 # ---------------------------------------------------------------------------
-# Fyers API
+# Fyers WebSocket Manager (Referenced from nifty.py)
+# ---------------------------------------------------------------------------
+
+class MarketWSManager:
+    def __init__(self, access_token):
+        self.access_token = access_token
+        self.ws = None
+        self.subscribed = set()
+        self.subscribed_at = {}
+        self.running = False
+        self.ws_thread = None
+        self.lock = threading.RLock()
+        
+        # In-memory store for live quotes: {symbol: {"lp": float, "atp": float, "bid": float, "ask": float, "volume": int, "time": float}}
+        self.live_quotes = {}
+
+    def on_message(self, message):
+        symbol = message.get("symbol") or message.get("n")
+        if symbol:
+            with self.lock:
+                q = self.live_quotes.setdefault(symbol, {})
+                
+                # Extract LTP (supporting both 'lp' and 'ltp')
+                ltp = message.get("lp") if message.get("lp") is not None else message.get("ltp")
+                if ltp is not None:
+                    q["lp"] = float(ltp)
+                
+                # Extract ATP (supporting 'avg_trade_price' and 'atp')
+                atp = message.get("avg_trade_price") if message.get("avg_trade_price") is not None else message.get("atp")
+                if atp is not None:
+                    q["atp"] = float(atp)
+                
+                if message.get("bid") is not None:
+                    q["bid"] = float(message.get("bid"))
+                if message.get("ask") is not None:
+                    q["ask"] = float(message.get("ask"))
+                if message.get("vol_traded_today") is not None:
+                    q["volume"] = int(message.get("vol_traded_today"))
+                elif message.get("volume") is not None:
+                    q["volume"] = int(message.get("volume"))
+                
+                q["time"] = time.time()
+
+    def on_error(self, msg):
+        pass  # Handle or log socket errors if needed
+
+    def on_close(self, msg):
+        pass  # Handle closure
+
+    def on_open(self):
+        with self.lock:
+            if self.subscribed and self.ws:
+                try:
+                    self.ws.subscribe(list(self.subscribed), "SymbolUpdate")
+                except Exception:
+                    pass
+        if self.ws:
+            self.ws.keep_running()
+
+    def _ws_connect(self):
+        try:
+            self.ws = data_ws.FyersDataSocket(
+                access_token=self.access_token,
+                log_path="",
+                litemode=False,
+                write_to_file=False,
+                reconnect=True,
+                on_connect=self.on_open,
+                on_close=self.on_close,
+                on_error=self.on_error,
+                on_message=self.on_message
+            )
+            self.ws.connect()
+        except Exception:
+            pass
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.ws_thread = threading.Thread(target=self._ws_connect, daemon=True)
+        self.ws_thread.start()
+
+    def subscribe(self, symbols):
+        new_symbols = set(symbols) - self.subscribed
+        if not new_symbols:
+            return
+        now = time.time()
+        with self.lock:
+            if self.ws:
+                try:
+                    self.ws.subscribe(list(new_symbols), "SymbolUpdate")
+                except Exception:
+                    pass
+            self.subscribed.update(new_symbols)
+            for s in new_symbols:
+                self.subscribed_at.setdefault(s, now)
+
+    def stop(self):
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close_connection()
+            except Exception:
+                pass
+        if self.ws_thread and self.ws_thread.is_alive():
+            self.ws_thread.join(timeout=2)
+
+    def get_quote(self, symbol):
+        with self.lock:
+            return self.live_quotes.get(symbol, {})
+
+
+# ---------------------------------------------------------------------------
+# Fyers REST API (for Option Chain structure, greeks, and expiries)
 # ---------------------------------------------------------------------------
 
 def fetch_chain(fyers, symbol, strikecount, expiry=0):
@@ -29,42 +144,32 @@ def fetch_chain(fyers, symbol, strikecount, expiry=0):
     })
 
 
-def fetch_quotes(fyers, symbols):
-    """Return {symbol: {lp, atp, bid, ask, volume}}."""
+def fetch_quotes(ws_manager, symbols):
+    """Return {symbol: {lp, atp, bid, ask, volume}} from WebSocket in-memory cache."""
     symbols = list(dict.fromkeys(symbols))
     quotes = {}
 
-    for i in range(0, len(symbols), QUOTE_BATCH):
-        response = fyers.quotes({
-            "symbols": ",".join(symbols[i:i + QUOTE_BATCH])
-        })
-
-        if response.get("s") != "ok":
-            raise RuntimeError(f"Quotes request failed: {response}")
-
-        for item in response.get("d", []):
-            if item.get("s") != "ok":
-                continue
-
-            v = item.get("v", {})
-            name = item.get("n") or v.get("symbol")
-
-            if name:
-                quotes[name] = {
-                    k: v.get(k)
-                    for k in ("lp", "atp", "bid", "ask", "volume")
-                }
+    for symbol in symbols:
+        q = ws_manager.get_quote(symbol)
+        quotes[symbol] = {
+            "lp": q.get("lp"),
+            "atp": q.get("atp"),
+            "bid": q.get("bid"),
+            "ask": q.get("ask"),
+            "volume": q.get("volume"),
+        }
 
     return quotes
 
 
-def fetch_spot(fyers, symbol):
-    quote = fetch_quotes(fyers, [symbol]).get(symbol)
+def fetch_spot(ws_manager, symbol):
+    q = ws_manager.get_quote(symbol)
+    lp = q.get("lp")
 
-    if not quote or not is_num(quote["lp"]):
-        raise RuntimeError(f"Spot LTP unavailable for {symbol}")
+    if not is_num(lp):
+        raise RuntimeError(f"Spot LTP unavailable via WebSocket for {symbol}")
 
-    return float(quote["lp"])
+    return float(lp)
 
 
 # ---------------------------------------------------------------------------
@@ -120,14 +225,8 @@ def build_option_map(rows):
     return option_map
 
 
-
 def build_delta_map(rows):
-    """Build {(strike, option_type): absolute delta} from option-chain rows.
-
-    Delta comes from Fyers optionchain() -> data -> optionsChain ->
-    each option row -> greeks -> delta. LTP/ATP are fetched separately
-    from fyers.quotes().
-    """
+    """Build {(strike, option_type): absolute delta} from option-chain rows."""
     delta_map = {}
 
     for row in rows:
@@ -144,10 +243,7 @@ def build_delta_map(rows):
         if not isinstance(greeks, dict):
             greeks = {}
 
-        # Fyers option-chain response uses the nested greeks.delta field.
         delta = greeks.get("delta")
-
-        # Keep direct-field fallback for API response-version compatibility.
         if not is_num(delta):
             delta = row.get("delta")
 
@@ -155,6 +251,7 @@ def build_delta_map(rows):
             delta_map[(strike, kind)] = abs(float(delta))
 
     return delta_map
+
 
 def build_oi_map(rows):
     """Build {(strike, leg): {'oi': value, 'oich': value}}."""
@@ -215,13 +312,7 @@ def three_around(strikes, centre, step):
 # ---------------------------------------------------------------------------
 
 def calculate_oi_metrics(oi_map, ce_strikes, pe_strikes):
-    """
-    PCR = sum(PE OI) / sum(CE OI)
-
-    Net OI change = sum(PE oich) - sum(CE oich)
-
-    Uses the exact selected CE and PE strike lists.
-    """
+    """PCR and Net OI change calculations."""
 
     def aggregate(strikes, leg, field):
         values = []
@@ -263,7 +354,7 @@ def ltp(quotes, symbol, what="LTP"):
     q = quotes.get(symbol)
 
     if not q or not is_num(q["lp"]):
-        raise RuntimeError(f"Invalid {what} for {symbol}")
+        raise RuntimeError(f"Invalid {what} for {symbol} (Waiting for WebSocket tick...)")
 
     return float(q["lp"])
 
@@ -281,10 +372,7 @@ def synthetic_future(window, option_map, quotes):
 
 
 def otm_windows(strikes, syn_fut, straddle):
-    """
-    Calculate breakevens and matched OTM CE/PE strike lists.
-    The shorter side is extended, never trimmed.
-    """
+    """Calculate breakevens and matched OTM CE/PE strike lists."""
     atm = closest(strikes, syn_fut)
     atm_i = strikes.index(atm)
 
@@ -345,13 +433,12 @@ def deviation_table(strikes, leg, option_map, quotes, delta_map):
             or not is_num(q.get("atp"))
             or float(q["atp"]) <= 0
         ):
-            raise RuntimeError(f"Invalid LTP/ATP for {symbol}")
+            raise RuntimeError(f"Invalid LTP/ATP for {symbol} (Waiting for WebSocket tick...)")
 
         if not is_num(delta):
             raise RuntimeError(
                 f"Missing/invalid option-chain greeks.delta for {leg} strike {k:,.0f}. "
-                "Check that optionchain() was called with greeks='1' and that this "
-                "strike row contains a numeric greeks.delta value."
+                "Check that optionchain() was called with greeks='1'."
             )
 
         lp = float(q["lp"])
@@ -379,8 +466,8 @@ def delta_adjusted_avg(df, leg):
     return float(values.mean())
 
 
-def compute(fyers, underlying, strikecount, expiry):
-    """Run the full pipeline and return everything the UI needs."""
+def compute(ws_manager, fyers, underlying, strikecount, expiry):
+    """Run the full pipeline using WebSocket quotes and return everything the UI needs."""
 
     chain = fetch_chain(fyers, underlying, strikecount, expiry)
 
@@ -392,10 +479,18 @@ def compute(fyers, underlying, strikecount, expiry):
     if not rows:
         raise RuntimeError("No option chain rows returned.")
 
-    # Greeks/delta are sourced from option-chain rows, not the Quotes API.
     delta_map = build_delta_map(rows)
-
     option_map = build_option_map(rows)
+
+    # Automatically collect all symbol subscriptions for WebSocket
+    all_symbols = [underlying]
+    for k, legs in option_map.items():
+        if "CE" in legs:
+            all_symbols.append(legs["CE"])
+        if "PE" in legs:
+            all_symbols.append(legs["PE"])
+            
+    ws_manager.subscribe(all_symbols)
 
     strikes = sorted(
         k for k, legs in option_map.items()
@@ -409,8 +504,8 @@ def compute(fyers, underlying, strikecount, expiry):
 
     step = min(b - a for a, b in zip(strikes, strikes[1:]))
 
-    # Spot
-    spot = fetch_spot(fyers, underlying)
+    # Spot from WebSocket
+    spot = fetch_spot(ws_manager, underlying)
 
     # Synthetic future from 3 strikes around spot
     spot_window = three_around(
@@ -425,7 +520,7 @@ def compute(fyers, underlying, strikecount, expiry):
         for leg in ("CE", "PE")
     ]
 
-    quotes = fetch_quotes(fyers, symbols)
+    quotes = fetch_quotes(ws_manager, symbols)
 
     syn_fut = synthetic_future(
         spot_window,
@@ -443,7 +538,7 @@ def compute(fyers, underlying, strikecount, expiry):
 
     quotes.update(
         fetch_quotes(
-            fyers,
+            ws_manager,
             [s for s in atm_symbols if s not in quotes],
         )
     )
@@ -453,9 +548,6 @@ def compute(fyers, underlying, strikecount, expiry):
     # Selected OTM strike ranges
     win = otm_windows(strikes, syn_fut, straddle)
 
-    # ---------------------------------------------------------------
-    # NEW: PCR and OI-change calculations from option-chain data
-    # ---------------------------------------------------------------
     oi_map = build_oi_map(rows)
 
     oi_metrics = calculate_oi_metrics(
@@ -464,7 +556,6 @@ def compute(fyers, underlying, strikecount, expiry):
         win["pe_strikes"],
     )
 
-    # Fetch quotes for selected OTM CE and PE options
     otm_symbols = (
         [option_map[k]["CE"] for k in win["ce_strikes"]]
         + [option_map[k]["PE"] for k in win["pe_strikes"]]
@@ -472,7 +563,7 @@ def compute(fyers, underlying, strikecount, expiry):
 
     quotes.update(
         fetch_quotes(
-            fyers,
+            ws_manager,
             [s for s in otm_symbols if s not in quotes],
         )
     )
@@ -570,7 +661,7 @@ def render(r):
 
     st.caption(
         f"Loaded both-leg strikes: {int(lo):,}–{int(hi):,} "
-        f"({count} strikes, step {int(step)})"
+        f"({count} strikes, step {int(step)}) [WebSocket Feed Live]"
     )
 
     for side, other, init, init_n, final in (
@@ -632,9 +723,7 @@ def render(r):
         f"{[int(s) for s in w['pe_strikes']]}"
     )
 
-    # ---------------------------------------------------------------
-    # NEW: PCR and OI change metrics
-    # ---------------------------------------------------------------
+    # PCR and OI change metrics
     oi = r["oi_metrics"]
 
     st.subheader("OI Analysis — Selected OTM Strike Range")
@@ -709,7 +798,7 @@ def render(r):
     )
 
     # Raw quote data
-    with st.expander("Raw Quotes API Data"):
+    with st.expander("Raw Quotes WebSocket Data"):
         raw = pd.DataFrame([
             {
                 "Symbol": symbol,
@@ -783,11 +872,11 @@ def render(r):
 
 def main():
     st.set_page_config(
-        page_title="NIFTY LTP-ATP + OI Signal",
+        page_title="NIFTY LTP-ATP + OI Signal (WebSocket)",
         layout="wide",
     )
 
-    st.title("NIFTY LTP − ATP + OI/PCR Signal")
+    st.title("NIFTY LTP − ATP + OI/PCR Signal (WebSocket Stream)")
 
     st.markdown(
         "<style>[data-testid='stMetricValue']"
@@ -828,7 +917,7 @@ def main():
             "Refresh Every (seconds)",
             min_value=1,
             max_value=3600,
-            value=15,
+            value=5,
             step=1,
         )
 
@@ -847,6 +936,18 @@ def main():
         st.info("Enter Client ID and Access Token in the sidebar.")
         return
 
+    # Initialize WebSocket Manager in Streamlit session state so it persists across UI reruns
+    if "ws_manager" not in st.session_state or st.session_state.get("token") != access_token:
+        if "ws_manager" in st.session_state:
+            st.session_state.ws_manager.stop()
+        
+        ws_mgr = MarketWSManager(access_token)
+        ws_mgr.start()
+        st.session_state.ws_manager = ws_mgr
+        st.session_state.token = access_token
+
+    ws_manager = st.session_state.ws_manager
+
     try:
         fyers = fyersModel.FyersModel(
             client_id=client_id,
@@ -861,9 +962,6 @@ def main():
             strikecount,
         )
         
-        # Fyers may return expiryData even when the initial request
-        # reports "Please provide valid expiry".
-        # Use the returned expiry list if it is available.
         expiries = (
             expiry_response.get("data", {}).get("expiryData", [])
         )
@@ -871,12 +969,6 @@ def main():
         if not expiries:
             raise RuntimeError(
                 f"No expiry data returned by Fyers: {expiry_response}"
-            )
-        
-
-        if not expiries:
-            raise RuntimeError(
-                "No expiry data returned by the option chain."
             )
 
         with st.sidebar:
@@ -889,6 +981,7 @@ def main():
             )
 
         result = compute(
+            ws_manager,
             fyers,
             underlying,
             strikecount,
