@@ -331,10 +331,7 @@ def otm_windows(strikes, syn_fut, straddle):
 
 
 def deviation_table(strikes, leg, option_map, quotes, delta_map):
-    """
-    Calculate (LTP - ATP) / ATP in percent per strike,
-    plus a normalized absolute-delta weight.
-    """
+    """Calculate per-strike deviation and deviation multiplied by abs(delta)."""
     rows = []
 
     for k in strikes:
@@ -344,8 +341,8 @@ def deviation_table(strikes, leg, option_map, quotes, delta_map):
 
         if (
             not q
-            or not is_num(q["lp"])
-            or not is_num(q["atp"])
+            or not is_num(q.get("lp"))
+            or not is_num(q.get("atp"))
             or float(q["atp"]) <= 0
         ):
             raise RuntimeError(f"Invalid LTP/ATP for {symbol}")
@@ -359,30 +356,24 @@ def deviation_table(strikes, leg, option_map, quotes, delta_map):
 
         lp = float(q["lp"])
         atp = float(q["atp"])
+        abs_delta = abs(float(delta))
+        dev = (lp - atp) / atp * 100
 
         rows.append({
             "Strike": k,
             f"{leg} LTP": lp,
             f"{leg} ATP": atp,
-            f"{leg} Dev %": (lp - atp) / atp * 100,
-            f"{leg} Weight": abs(float(delta)),
+            f"{leg} Delta": abs_delta,
+            f"{leg} Dev %": dev,
+            f"{leg} Dev × |Delta| %": dev * abs_delta,
         })
 
-    df = pd.DataFrame(rows)
-    weight_sum = df[f"{leg} Weight"].sum()
-
-    if weight_sum <= 0:
-        raise RuntimeError(f"Cannot calculate {leg} weights: all deltas are zero.")
-
-    df[f"{leg} Weight"] /= weight_sum
-
-    return df
+    return pd.DataFrame(rows)
 
 
-def weighted_avg(df, leg):
-    return float(
-        (df[f"{leg} Dev %"] * df[f"{leg} Weight"]).sum()
-    )
+def delta_adjusted_sum(df, leg):
+    """Sum each strike's Dev% * absolute delta; no normalization or distance weights."""
+    return float(df[f"{leg} Dev × |Delta| %"].sum())
 
 
 def compute(fyers, underlying, strikecount, expiry):
@@ -506,8 +497,8 @@ def compute(fyers, underlying, strikecount, expiry):
         "win": win,
         "ce_df": ce_df,
         "pe_df": pe_df,
-        "avg_ce": weighted_avg(ce_df, "CE"),
-        "avg_pe": weighted_avg(pe_df, "PE"),
+        "avg_ce": delta_adjusted_sum(ce_df, "CE"),
+        "avg_pe": delta_adjusted_sum(pe_df, "PE"),
         "oi_metrics": oi_metrics,
         "quotes": quotes,
         "strike_range": (
@@ -535,37 +526,33 @@ def ms_until_next_boundary(step_seconds, buffer_ms=300):
     return max(step_ms - ms_today % step_ms + buffer_ms, 200)
 
 
-def render_calculation(df, leg, avg):
+def render_calculation(df, leg, total):
     st.write(
-        f"**OTM {leg} Strikes "
-        f"(({leg} LTP − {leg} ATP) / {leg} ATP):**"
+        f"**OTM {leg} Strikes: Dev % × absolute delta** "
+        f"where Dev = ({leg} LTP − {leg} ATP) / {leg} ATP × 100:"
     )
 
     for _, r in df.iterrows():
         ltp_ = r[f"{leg} LTP"]
         atp_ = r[f"{leg} ATP"]
+        delta = r[f"{leg} Delta"]
         dev = r[f"{leg} Dev %"]
-        weight = r[f"{leg} Weight"]
+        adjusted = r[f"{leg} Dev × |Delta| %"]
 
         st.write(
             f"{r['Strike']:,.0f}: "
             f"({ltp_:,.2f} − {atp_:,.2f}) / {atp_:,.2f} "
-            f"= {dev:+,.2f}%  "
-            f"× weight {weight:.1%} = "
-            f"**{dev * weight:+,.2f}%**"
+            f"= {dev:+,.2f}% × |delta| {delta:.4f} "
+            f"= **{adjusted:+,.2f}%**"
         )
 
     terms = " + ".join(
-        f"({d * weight:+,.2f}%)"
-        for d, weight in zip(
-            df[f"{leg} Dev %"],
-            df[f"{leg} Weight"],
-        )
+        f"({value:+,.2f}%)"
+        for value in df[f"{leg} Dev × |Delta| %"]
     )
-
     st.write(
-        f"**Weighted Avg {leg} Dev:** "
-        f"{terms} = **{avg:+,.2f}%**"
+        f"**Sum of {leg} Dev × |Delta|:** "
+        f"{terms} = **{total:+,.2f}%**"
     )
 
 
@@ -677,23 +664,27 @@ def render(r):
     )
 
     # Individual strike tables
-    st.subheader("CE / PE (LTP − ATP) / ATP at OTM Strikes")
+    st.subheader("OTM CE / PE Deviation × Absolute Delta")
 
     left, right = st.columns(2)
 
-    pct = lambda leg: {
-        f"{leg} Dev %": "{:+.2f}%",
-        f"{leg} Weight": "{:.1%}",
-    }
+    def table_format(leg):
+        return {
+            f"{leg} LTP": "{:.2f}",
+            f"{leg} ATP": "{:.2f}",
+            f"{leg} Delta": "{:.4f}",
+            f"{leg} Dev %": "{:+.2f}%",
+            f"{leg} Dev × |Delta| %": "{:+.2f}%",
+        }
 
     left.dataframe(
-        r["ce_df"].style.format(pct("CE")),
+        r["ce_df"].style.format(table_format("CE")),
         use_container_width=True,
         hide_index=True,
     )
 
     right.dataframe(
-        r["pe_df"].style.format(pct("PE")),
+        r["pe_df"].style.format(table_format("PE")),
         use_container_width=True,
         hide_index=True,
     )
@@ -753,15 +744,15 @@ def render(r):
         )
 
         st.latex(
-            r"w_K=\frac{|Delta_K|}{\sum_J |Delta_J|}"
+            r"AdjustedDev_K=Dev_K\times|Delta_K|"
         )
 
         st.latex(
-            r"AvgCEDev=\sum_{K\in OTM\ CE}w_K Dev^{CE}_K"
+            r"CE_{total}=\sum_{K\in OTM\ CE}(Dev^{CE}_K\times|Delta^{CE}_K|)"
         )
 
         st.latex(
-            r"AvgPEDev=\sum_{K\in OTM\ PE}w_K Dev^{PE}_K"
+            r"PE_{total}=\sum_{K\in OTM\ PE}(Dev^{PE}_K\times|Delta^{PE}_K|)"
         )
 
         st.latex(
