@@ -25,6 +25,7 @@ def fetch_chain(fyers, symbol, strikecount, expiry=0):
         "symbol": symbol,
         "strikecount": int(strikecount),
         "timestamp": int(expiry),
+        "greeks": "1",
     })
 
 
@@ -118,6 +119,42 @@ def build_option_map(rows):
 
     return option_map
 
+
+
+def build_delta_map(rows):
+    """Build {(strike, option_type): absolute delta} from option-chain rows.
+
+    Delta comes from Fyers optionchain() -> data -> optionsChain ->
+    each option row -> greeks -> delta. LTP/ATP are fetched separately
+    from fyers.quotes().
+    """
+    delta_map = {}
+
+    for row in rows:
+        kind = row.get("option_type")
+        if kind not in ("CE", "PE"):
+            continue
+
+        try:
+            strike = float(row.get("strike_price"))
+        except (TypeError, ValueError):
+            continue
+
+        greeks = row.get("greeks")
+        if not isinstance(greeks, dict):
+            greeks = {}
+
+        # Fyers option-chain response uses the nested greeks.delta field.
+        delta = greeks.get("delta")
+
+        # Keep direct-field fallback for API response-version compatibility.
+        if not is_num(delta):
+            delta = row.get("delta")
+
+        if is_num(delta):
+            delta_map[(strike, kind)] = abs(float(delta))
+
+    return delta_map
 
 def build_oi_map(rows):
     """Build {(strike, leg): {'oi': value, 'oich': value}}."""
@@ -314,7 +351,11 @@ def deviation_table(strikes, leg, option_map, quotes, delta_map):
             raise RuntimeError(f"Invalid LTP/ATP for {symbol}")
 
         if not is_num(delta):
-            raise RuntimeError(f"Invalid delta for {leg} strike {k:,.0f}")
+            raise RuntimeError(
+                f"Missing/invalid option-chain greeks.delta for {leg} strike {k:,.0f}. "
+                "Check that optionchain() was called with greeks='1' and that this "
+                "strike row contains a numeric greeks.delta value."
+            )
 
         lp = float(q["lp"])
         atp = float(q["atp"])
@@ -356,6 +397,9 @@ def compute(fyers, underlying, strikecount, expiry):
 
     if not rows:
         raise RuntimeError("No option chain rows returned.")
+
+    # Greeks/delta are sourced from option-chain rows, not the Quotes API.
+    delta_map = build_delta_map(rows)
 
     option_map = build_option_map(rows)
 
@@ -438,14 +482,6 @@ def compute(fyers, underlying, strikecount, expiry):
             [s for s in otm_symbols if s not in quotes],
         )
     )
-
-    # Absolute-delta weights for each selected option leg
-    delta_map = {
-        (float(row["strike_price"]), row["option_type"]): row.get("delta")
-        for row in rows
-        if row.get("option_type") in ("CE", "PE")
-        and is_num(row.get("strike_price"))
-    }
 
     ce_df = deviation_table(
         win["ce_strikes"],
