@@ -709,7 +709,7 @@ def render(r):
                 }
                 for h in st.session_state.alert_history
             ])
-            st.dataframe(history_df, use_container_width=True, hide_index=True)
+            st.dataframe(history_df, width="stretch", hide_index=True)
 
     for side, other, init, init_n, final in (
         ("CE", "PE", w["upper_init"], w["ce_init"], w["upper"]),
@@ -819,13 +819,13 @@ def render(r):
 
     left.dataframe(
         r["ce_df"].style.format(table_format("CE")),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
     right.dataframe(
         r["pe_df"].style.format(table_format("PE")),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -860,7 +860,7 @@ def render(r):
 
         st.dataframe(
             raw,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
