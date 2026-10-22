@@ -1,4 +1,4 @@
-"""NIFTY OTM CE/PE LTP - ATP + OI/PCR signal (Fyers WebSocket + Streamlit).
+"""NIFTY OTM CE/PE LTP - ATP + OI/PCR signal (Fyers WebSocket + Streamlit + Alerts).
 Display only, no orders.
 """
 
@@ -62,10 +62,10 @@ class MarketWSManager:
                 q["time"] = time.time()
 
     def on_error(self, msg):
-        pass  # Handle or log socket errors if needed
+        pass
 
     def on_close(self, msg):
-        pass  # Handle closure
+        pass
 
     def on_open(self):
         with self.lock:
@@ -482,7 +482,6 @@ def compute(ws_manager, fyers, underlying, strikecount, expiry):
     delta_map = build_delta_map(rows)
     option_map = build_option_map(rows)
 
-    # Automatically collect all symbol subscriptions for WebSocket
     all_symbols = [underlying]
     for k, legs in option_map.items():
         if "CE" in legs:
@@ -504,10 +503,8 @@ def compute(ws_manager, fyers, underlying, strikecount, expiry):
 
     step = min(b - a for a, b in zip(strikes, strikes[1:]))
 
-    # Spot from WebSocket
     spot = fetch_spot(ws_manager, underlying)
 
-    # Synthetic future from 3 strikes around spot
     spot_window = three_around(
         strikes,
         closest(strikes, spot),
@@ -528,7 +525,6 @@ def compute(ws_manager, fyers, underlying, strikecount, expiry):
         quotes,
     )
 
-    # Synthetic ATM and ATM straddle
     atm = closest(strikes, syn_fut)
 
     atm_symbols = [
@@ -545,7 +541,6 @@ def compute(ws_manager, fyers, underlying, strikecount, expiry):
 
     straddle = sum(ltp(quotes, s) for s in atm_symbols)
 
-    # Selected OTM strike ranges
     win = otm_windows(strikes, syn_fut, straddle)
 
     oi_map = build_oi_map(rows)
@@ -663,6 +658,58 @@ def render(r):
         f"Loaded both-leg strikes: {int(lo):,}–{int(hi):,} "
         f"({count} strikes, step {int(step)}) [WebSocket Feed Live]"
     )
+
+    # ---------------------------------------------------------------------------
+    # ALERT & HISTORY TRACKING LOGIC
+    # ---------------------------------------------------------------------------
+    if "alert_history" not in st.session_state:
+        st.session_state.alert_history = []
+
+    avg_ce = r["avg_ce"]
+    avg_pe = r["avg_pe"]
+    
+    val_ce_int = int(abs(avg_ce))
+    val_pe_int = int(abs(avg_pe))
+
+    if val_ce_int == val_pe_int:
+        current_time_str = datetime.now(IST).strftime('%d-%b-%Y %I:%M:%S %p IST')
+        match_entry = {
+            "time": current_time_str,
+            "avg_ce": avg_ce,
+            "avg_pe": avg_pe,
+            "int_val": val_ce_int
+        }
+        # Prevent duplicate entries within the same second
+        if not st.session_state.alert_history or st.session_state.alert_history[-1]["time"] != current_time_str:
+            st.session_state.alert_history.append(match_entry)
+
+        st.warning(
+            f"🚨 **ALERT MATCH DETECTED!** Integer parts of absolute average deviations match: "
+            f"|Avg CE Dev| = {abs(avg_ce):,.2f} (Integer: {val_ce_int}) | "
+            f"|Avg PE Dev| = {abs(avg_pe):,.2f} (Integer: {val_pe_int})"
+        )
+
+    # Display Alert History Tracker section
+    if st.session_state.alert_history:
+        st.subheader("🚨 Deviation Match Alert History & Last Occurrence")
+        last_match = st.session_state.alert_history[-1]
+        st.info(
+            f"**Last Happened At:** {last_match['time']}  \n"
+            f"• **Avg CE Dev × |Delta|:** {last_match['avg_ce']:+.2f}% (Integer Value: {int(abs(last_match['avg_ce']))})  \n"
+            f"• **Avg PE Dev × |Delta|:** {last_match['avg_pe']:+.2f}% (Integer Value: {int(abs(last_match['avg_pe']))})"
+        )
+        
+        with st.expander("View Full Match History Log"):
+            history_df = pd.DataFrame([
+                {
+                    "Timestamp": h["time"],
+                    "Avg CE Dev %": f"{h['avg_ce']:+.2f}%",
+                    "Avg PE Dev %": f"{h['avg_pe']:+.2f}%",
+                    "Matched Integer": h["int_val"]
+                }
+                for h in st.session_state.alert_history
+            ])
+            st.dataframe(history_df, use_container_width=True, hide_index=True)
 
     for side, other, init, init_n, final in (
         ("CE", "PE", w["upper_init"], w["ce_init"], w["upper"]),
@@ -872,11 +919,11 @@ def render(r):
 
 def main():
     st.set_page_config(
-        page_title="NIFTY LTP-ATP + OI Signal (WebSocket)",
+        page_title="NIFTY LTP-ATP + OI Signal (WebSocket + Alerts)",
         layout="wide",
     )
 
-    st.title("NIFTY LTP − ATP + OI/PCR Signal (WebSocket Stream)")
+    st.title("NIFTY LTP − ATP + OI/PCR Signal (WebSocket Stream & Alerts)")
 
     st.markdown(
         "<style>[data-testid='stMetricValue']"
@@ -936,7 +983,6 @@ def main():
         st.info("Enter Client ID and Access Token in the sidebar.")
         return
 
-    # Initialize WebSocket Manager in Streamlit session state so it persists across UI reruns
     if "ws_manager" not in st.session_state or st.session_state.get("token") != access_token:
         if "ws_manager" in st.session_state:
             st.session_state.ws_manager.stop()
