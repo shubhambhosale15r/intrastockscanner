@@ -293,21 +293,17 @@ def otm_windows(strikes, syn_fut, straddle):
     }
 
 
-def deviation_table(strikes, leg, option_map, quotes, center, bandwidth):
+def deviation_table(strikes, leg, option_map, quotes, delta_map):
     """
     Calculate (LTP - ATP) / ATP in percent per strike,
-    plus a normalized distance weight.
+    plus a normalized absolute-delta weight.
     """
-    if bandwidth <= 0:
-        raise RuntimeError(
-            "Straddle is zero or negative; cannot weight strikes."
-        )
-
     rows = []
 
     for k in strikes:
         symbol = option_map[k][leg]
         q = quotes.get(symbol)
+        delta = delta_map.get((k, leg))
 
         if (
             not q
@@ -317,6 +313,9 @@ def deviation_table(strikes, leg, option_map, quotes, center, bandwidth):
         ):
             raise RuntimeError(f"Invalid LTP/ATP for {symbol}")
 
+        if not is_num(delta):
+            raise RuntimeError(f"Invalid delta for {leg} strike {k:,.0f}")
+
         lp = float(q["lp"])
         atp = float(q["atp"])
 
@@ -325,13 +324,16 @@ def deviation_table(strikes, leg, option_map, quotes, center, bandwidth):
             f"{leg} LTP": lp,
             f"{leg} ATP": atp,
             f"{leg} Dev %": (lp - atp) / atp * 100,
-            f"{leg} Weight": math.exp(
-                -(((k - center) / bandwidth) ** 2)
-            ),
+            f"{leg} Weight": abs(float(delta)),
         })
 
     df = pd.DataFrame(rows)
-    df[f"{leg} Weight"] /= df[f"{leg} Weight"].sum()
+    weight_sum = df[f"{leg} Weight"].sum()
+
+    if weight_sum <= 0:
+        raise RuntimeError(f"Cannot calculate {leg} weights: all deltas are zero.")
+
+    df[f"{leg} Weight"] /= weight_sum
 
     return df
 
@@ -437,14 +439,20 @@ def compute(fyers, underlying, strikecount, expiry):
         )
     )
 
-    # Distance weights anchored on continuous synthetic future
+    # Absolute-delta weights for each selected option leg
+    delta_map = {
+        (float(row["strike_price"]), row["option_type"]): row.get("delta")
+        for row in rows
+        if row.get("option_type") in ("CE", "PE")
+        and is_num(row.get("strike_price"))
+    }
+
     ce_df = deviation_table(
         win["ce_strikes"],
         "CE",
         option_map,
         quotes,
-        syn_fut,
-        straddle,
+        delta_map,
     )
 
     pe_df = deviation_table(
@@ -452,8 +460,7 @@ def compute(fyers, underlying, strikecount, expiry):
         "PE",
         option_map,
         quotes,
-        syn_fut,
-        straddle,
+        delta_map,
     )
 
     return {
@@ -710,8 +717,7 @@ def render(r):
         )
 
         st.latex(
-            r"w_K=\frac{e^{-((K-SynFut)/Straddle)^2}}"
-            r"{\sum_J e^{-((J-SynFut)/Straddle)^2}}"
+            r"w_K=\frac{|Delta_K|}{\sum_J |Delta_J|}"
         )
 
         st.latex(
