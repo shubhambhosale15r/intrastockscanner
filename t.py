@@ -371,9 +371,12 @@ def deviation_table(strikes, leg, option_map, quotes, delta_map):
     return pd.DataFrame(rows)
 
 
-def delta_adjusted_sum(df, leg):
-    """Sum each strike's Dev% * absolute delta; no normalization or distance weights."""
-    return float(df[f"{leg} Dev × |Delta| %"].sum())
+def delta_adjusted_avg(df, leg):
+    """Arithmetic mean of each strike's Dev% * absolute delta."""
+    values = df[f"{leg} Dev × |Delta| %"]
+    if values.empty:
+        raise RuntimeError(f"No {leg} strikes available to average.")
+    return float(values.mean())
 
 
 def compute(fyers, underlying, strikecount, expiry):
@@ -497,8 +500,8 @@ def compute(fyers, underlying, strikecount, expiry):
         "win": win,
         "ce_df": ce_df,
         "pe_df": pe_df,
-        "avg_ce": delta_adjusted_sum(ce_df, "CE"),
-        "avg_pe": delta_adjusted_sum(pe_df, "PE"),
+        "avg_ce": delta_adjusted_avg(ce_df, "CE"),
+        "avg_pe": delta_adjusted_avg(pe_df, "PE"),
         "oi_metrics": oi_metrics,
         "quotes": quotes,
         "strike_range": (
@@ -526,7 +529,7 @@ def ms_until_next_boundary(step_seconds, buffer_ms=300):
     return max(step_ms - ms_today % step_ms + buffer_ms, 200)
 
 
-def render_calculation(df, leg, total):
+def render_calculation(df, leg, avg):
     st.write(
         f"**OTM {leg} Strikes: Dev % × absolute delta** "
         f"where Dev = ({leg} LTP − {leg} ATP) / {leg} ATP × 100:"
@@ -550,9 +553,10 @@ def render_calculation(df, leg, total):
         f"({value:+,.2f}%)"
         for value in df[f"{leg} Dev × |Delta| %"]
     )
+    count = len(df)
     st.write(
-        f"**Sum of {leg} Dev × |Delta|:** "
-        f"{terms} = **{total:+,.2f}%**"
+        f"**Average {leg} Dev × |Delta|:** "
+        f"({terms}) / {count} = **{avg:+,.2f}%**"
     )
 
 
@@ -596,12 +600,12 @@ def render(r):
     m = st.columns(4)
 
     m[0].metric(
-        "Wtd Avg CE Dev. %",
+        "Avg CE Dev × |Delta| %",
         f"{r['avg_ce']:+,.2f}%",
     )
 
     m[1].metric(
-        "Wtd Avg PE Dev. %",
+        "Avg PE Dev × |Delta| %",
         f"{r['avg_pe']:+,.2f}%",
     )
 
@@ -748,11 +752,11 @@ def render(r):
         )
 
         st.latex(
-            r"CE_{total}=\sum_{K\in OTM\ CE}(Dev^{CE}_K\times|Delta^{CE}_K|)"
+            r"AvgCE=\frac{1}{N_{CE}}\sum_{K\in OTM\ CE}(Dev^{CE}_K\times|Delta^{CE}_K|)"
         )
 
         st.latex(
-            r"PE_{total}=\sum_{K\in OTM\ PE}(Dev^{PE}_K\times|Delta^{PE}_K|)"
+            r"AvgPE=\frac{1}{N_{PE}}\sum_{K\in OTM\ PE}(Dev^{PE}_K\times|Delta^{PE}_K|)"
         )
 
         st.latex(
