@@ -1297,7 +1297,7 @@ def main():
         layout="wide",
     )
 
-    st.title("NIFTY LTP − ATP + OI/PCR Signal (WebSocket Stream & Alerts)")
+    st.header("NIFTY LTP − ATP + OI/PCR Signal (WebSocket Stream & Alerts)")
 
     st.markdown(
         "<style>[data-testid='stMetricValue']"
