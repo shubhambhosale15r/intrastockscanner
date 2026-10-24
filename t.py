@@ -276,6 +276,129 @@ def build_oi_map(rows):
     return oi_map
 
 
+# ---------------------------------------------------------------------------
+# Delta-adjusted turnover-proxy ranking
+# ---------------------------------------------------------------------------
+
+def first_valid_number(row, keys):
+    """Return the first finite numeric value found under the supplied keys."""
+    for key in keys:
+        value = row.get(key)
+        if is_num(value):
+            return float(value)
+    return None
+
+
+def build_turnover_table(rows):
+    """Rank returned CE/PE contracts by |delta| * LTP * cumulative volume.
+
+    This is a delta-adjusted activity/turnover proxy, not exchange-reported
+    traded turnover: latest LTP is multiplied by the day's cumulative volume.
+    """
+    ranked_rows = []
+
+    for row in rows:
+        kind = row.get("option_type")
+        if kind not in ("CE", "PE"):
+            continue
+
+        try:
+            strike = float(row.get("strike_price"))
+        except (TypeError, ValueError):
+            continue
+
+        greeks = row.get("greeks")
+        if not isinstance(greeks, dict):
+            greeks = {}
+
+        delta = first_valid_number(
+            {"greeks_delta": greeks.get("delta"), "delta": row.get("delta")},
+            ("greeks_delta", "delta"),
+        )
+        ltp_value = first_valid_number(row, ("ltp", "lp"))
+        volume = first_valid_number(
+            row,
+            ("volume", "vol_traded_today", "v", "volumeTradedToday"),
+        )
+
+        # Contracts with missing required fields cannot be ranked reliably.
+        if delta is None or ltp_value is None or volume is None:
+            continue
+        if ltp_value < 0 or volume < 0:
+            continue
+
+        symbol = (
+            row.get("symbol")
+            or row.get("name")
+            or row.get("original_name")
+            or row.get("ex_symbol")
+            or ""
+        )
+        abs_delta = abs(delta)
+        proxy = abs_delta * ltp_value * volume
+
+        ranked_rows.append({
+            "Strike": strike,
+            "Type": kind,
+            "Symbol": symbol,
+            "LTP": ltp_value,
+            "Volume": volume,
+            "|Delta|": abs_delta,
+            "|Delta| × LTP × Volume": proxy,
+        })
+
+    columns = [
+        "Rank", "Strike", "Type", "Symbol", "LTP", "Volume",
+        "|Delta|", "|Delta| × LTP × Volume",
+    ]
+    if not ranked_rows:
+        return pd.DataFrame(columns=columns)
+
+    df = pd.DataFrame(ranked_rows)
+    df = df.sort_values(
+        "|Delta| × LTP × Volume",
+        ascending=False,
+        kind="stable",
+    ).reset_index(drop=True)
+    df.insert(0, "Rank", range(1, len(df) + 1))
+    return df[columns]
+
+
+def get_chain_spot(rows):
+    """Best-effort spot extraction from the underlying row in option-chain data."""
+    for row in rows:
+        if row.get("option_type") in ("CE", "PE"):
+            continue
+        spot_value = first_valid_number(row, ("ltp", "lp", "fp"))
+        if spot_value is not None and spot_value > 0:
+            return spot_value
+    return None
+
+
+def select_signal_rows(rows, spot, strikecount):
+    """Keep the configured ATM +/- strikecount strikes for existing signal logic."""
+    option_rows = [row for row in rows if row.get("option_type") in ("CE", "PE")]
+    available_strikes = sorted({
+        float(row["strike_price"])
+        for row in option_rows
+        if is_num(row.get("strike_price"))
+    })
+    if len(available_strikes) < 3:
+        raise RuntimeError("Fewer than 3 option strikes returned by FYERS.")
+
+    centre = closest(available_strikes, spot)
+    centre_index = available_strikes.index(centre)
+    low = max(0, centre_index - int(strikecount))
+    high = min(len(available_strikes), centre_index + int(strikecount) + 1)
+    selected = set(available_strikes[low:high])
+
+    return [
+        row for row in option_rows
+        if is_num(row.get("strike_price"))
+        and float(row["strike_price"]) in selected
+    ]
+
+
 def closest(strikes, price):
     return min(strikes, key=lambda s: abs(s - price))
 
@@ -466,44 +589,175 @@ def delta_adjusted_avg(df, leg):
     return float(values.mean())
 
 
-def compute(ws_manager, fyers, underlying, strikecount, expiry):
-    """Run the full pipeline using WebSocket quotes and return everything the UI needs."""
+def top3_contract_deviation_table(top3_contracts, option_map, quotes, delta_map):
+    """Calculate LTP-ATP deviations only for the actual Top-3 contracts.
 
-    chain = fetch_chain(fyers, underlying, strikecount, expiry)
+    First inspect each ranked contract's Type. A CE row contributes only to
+    the CE average; a PE row contributes only to the PE average. If the same
+    strike appears as both CE and PE in the Top 3, each contract contributes
+    to its own side's average. Strikes/contracts outside the Top 3 are not
+    included.
+    """
+    result_rows = []
+    ce_values = []
+    pe_values = []
+    ce_complete = True
+    pe_complete = True
+    expected_ce = 0
+    expected_pe = 0
+
+    for _, contract in top3_contracts.iterrows():
+        rank = int(contract["Rank"])
+        strike = float(contract["Strike"])
+        leg = str(contract["Type"]).upper()
+        symbol = option_map.get(strike, {}).get(leg)
+        if not symbol:
+            symbol = contract.get("Symbol")
+
+        quote = quotes.get(symbol, {}) if symbol else {}
+        delta = delta_map.get((strike, leg))
+        lp = quote.get("lp")
+        atp = quote.get("atp")
+
+        if leg == "CE":
+            expected_ce += 1
+        elif leg == "PE":
+            expected_pe += 1
+
+        valid = (
+            leg in ("CE", "PE")
+            and symbol is not None
+            and is_num(lp)
+            and is_num(atp)
+            and float(atp) > 0
+            and is_num(delta)
+        )
+
+        if valid:
+            lp = float(lp)
+            atp = float(atp)
+            abs_delta = abs(float(delta))
+            dev = (lp - atp) / atp * 100
+            adjusted = dev * abs_delta
+            status = "OK"
+            if leg == "CE":
+                ce_values.append(adjusted)
+            else:
+                pe_values.append(adjusted)
+        else:
+            lp = float(lp) if is_num(lp) else None
+            atp = float(atp) if is_num(atp) else None
+            abs_delta = abs(float(delta)) if is_num(delta) else None
+            dev = None
+            adjusted = None
+            status = "Waiting for valid WebSocket LTP/ATP or delta"
+            if leg == "CE":
+                ce_complete = False
+            elif leg == "PE":
+                pe_complete = False
+
+        result_rows.append({
+            "Rank": rank,
+            "Strike": strike,
+            "Type": leg,
+            "Symbol": symbol or "Unavailable",
+            "LTP": lp,
+            "ATP": atp,
+            "|Delta|": abs_delta,
+            "Dev %": dev,
+            "Dev × |Delta| %": adjusted,
+            "Status": status,
+        })
+
+    avg_ce = (
+        float(sum(ce_values) / expected_ce)
+        if expected_ce > 0 and ce_complete and len(ce_values) == expected_ce
+        else None
+    )
+    avg_pe = (
+        float(sum(pe_values) / expected_pe)
+        if expected_pe > 0 and pe_complete and len(pe_values) == expected_pe
+        else None
+    )
+
+    return pd.DataFrame(result_rows), avg_ce, avg_pe
+
+
+def compute(ws_manager, fyers, underlying, strikecount, expiry):
+    """Run existing signal calculations plus a widest-chain turnover ranking."""
+
+    # FYERS caps option-chain requests at 50 strikes on either side of ATM.
+    # Use that widest response for ranking; keep the user's strikecount for
+    # the existing LTP-ATP and OI signal calculations below.
+    chain = fetch_chain(fyers, underlying, 50, expiry)
 
     if chain.get("s") == "error" or chain.get("code", 200) != 200:
         raise RuntimeError(f"Option-chain request failed: {chain}")
 
-    rows = chain.get("data", {}).get("optionsChain", [])
-
-    if not rows:
+    chain_rows = chain.get("data", {}).get("optionsChain", [])
+    if not chain_rows:
         raise RuntimeError("No option chain rows returned.")
 
+    turnover_df = build_turnover_table(chain_rows)
+
+    # Use the exact Top-3 ranked contracts, preserving each contract's CE/PE type.
+    # A strike may appear twice (once as CE and once as PE), and each entry
+    # contributes only to the average for its own option type.
+    full_option_map = build_option_map(chain_rows)
+    full_delta_map = build_delta_map(chain_rows)
+    top3_contracts = (
+        turnover_df.head(3)[["Rank", "Strike", "Type", "Symbol"]].copy()
+        if not turnover_df.empty
+        else pd.DataFrame(columns=["Rank", "Strike", "Type", "Symbol"])
+    )
+    top3_symbols = []
+    for _, contract in top3_contracts.iterrows():
+        strike = float(contract["Strike"])
+        leg = str(contract["Type"]).upper()
+        symbol = full_option_map.get(strike, {}).get(leg) or contract.get("Symbol")
+        if symbol:
+            top3_symbols.append(symbol)
+
+    # Subscribe to the underlying first; the chain response can supply
+    # an initial spot fallback before the first WebSocket tick arrives.
+    ws_manager.subscribe([underlying])
+    try:
+        spot = fetch_spot(ws_manager, underlying)
+    except RuntimeError:
+        spot = get_chain_spot(chain_rows)
+        if not is_num(spot):
+            raise RuntimeError(
+                f"Spot LTP unavailable for {underlying}; waiting for WebSocket/chain data."
+            )
+        spot = float(spot)
+
+    # Keep the existing signal and OI calculations restricted to the selected
+    # number of strikes on either side of the spot/ATM; turnover ranking uses
+    # the widest chain response above.
+    rows = select_signal_rows(chain_rows, spot, strikecount)
     delta_map = build_delta_map(rows)
     option_map = build_option_map(rows)
 
     all_symbols = [underlying]
-    for k, legs in option_map.items():
+    for legs in option_map.values():
         if "CE" in legs:
             all_symbols.append(legs["CE"])
         if "PE" in legs:
             all_symbols.append(legs["PE"])
-            
+    # Add only the specific ranked contracts in the Top 3.
+    all_symbols.extend(top3_symbols)
     ws_manager.subscribe(all_symbols)
 
     strikes = sorted(
         k for k, legs in option_map.items()
         if "CE" in legs and "PE" in legs
     )
-
     if len(strikes) < 3:
         raise RuntimeError(
-            "Fewer than 3 strikes with both CE and PE in the chain."
+            "Fewer than 3 strikes with both CE and PE in the selected signal range."
         )
 
     step = min(b - a for a, b in zip(strikes, strikes[1:]))
-
-    spot = fetch_spot(ws_manager, underlying)
 
     spot_window = three_around(
         strikes,
@@ -516,7 +770,6 @@ def compute(ws_manager, fyers, underlying, strikecount, expiry):
         for k in spot_window
         for leg in ("CE", "PE")
     ]
-
     quotes = fetch_quotes(ws_manager, symbols)
 
     syn_fut = synthetic_future(
@@ -526,25 +779,21 @@ def compute(ws_manager, fyers, underlying, strikecount, expiry):
     )
 
     atm = closest(strikes, syn_fut)
-
     atm_symbols = [
         option_map[atm]["CE"],
         option_map[atm]["PE"],
     ]
-
     quotes.update(
         fetch_quotes(
             ws_manager,
-            [s for s in atm_symbols if s not in quotes],
+            [symbol for symbol in atm_symbols if symbol not in quotes],
         )
     )
 
-    straddle = sum(ltp(quotes, s) for s in atm_symbols)
-
+    straddle = sum(ltp(quotes, symbol) for symbol in atm_symbols)
     win = otm_windows(strikes, syn_fut, straddle)
 
     oi_map = build_oi_map(rows)
-
     oi_metrics = calculate_oi_metrics(
         oi_map,
         win["ce_strikes"],
@@ -555,28 +804,28 @@ def compute(ws_manager, fyers, underlying, strikecount, expiry):
         [option_map[k]["CE"] for k in win["ce_strikes"]]
         + [option_map[k]["PE"] for k in win["pe_strikes"]]
     )
-
     quotes.update(
         fetch_quotes(
             ws_manager,
-            [s for s in otm_symbols if s not in quotes],
+            [symbol for symbol in otm_symbols if symbol not in quotes],
         )
     )
 
     ce_df = deviation_table(
-        win["ce_strikes"],
-        "CE",
-        option_map,
-        quotes,
-        delta_map,
+        win["ce_strikes"], "CE", option_map, quotes, delta_map
+    )
+    pe_df = deviation_table(
+        win["pe_strikes"], "PE", option_map, quotes, delta_map
     )
 
-    pe_df = deviation_table(
-        win["pe_strikes"],
-        "PE",
-        option_map,
+    # Refresh only the exact Top-3 ranked contracts. Each row's Type decides
+    # which average it contributes to (CE rows -> CE average, PE rows -> PE average).
+    quotes.update(fetch_quotes(ws_manager, top3_symbols))
+    top3_deviation_df, top3_avg_ce, top3_avg_pe = top3_contract_deviation_table(
+        top3_contracts,
+        full_option_map,
         quotes,
-        delta_map,
+        full_delta_map,
     )
 
     return {
@@ -590,6 +839,11 @@ def compute(ws_manager, fyers, underlying, strikecount, expiry):
         "avg_pe": delta_adjusted_avg(pe_df, "PE"),
         "oi_metrics": oi_metrics,
         "quotes": quotes,
+        "turnover_df": turnover_df,
+        "top3_contracts": top3_contracts,
+        "top3_deviation_df": top3_deviation_df,
+        "top3_avg_ce": top3_avg_ce,
+        "top3_avg_pe": top3_avg_pe,
         "strike_range": (
             strikes[0],
             strikes[-1],
@@ -770,6 +1024,115 @@ def render(r):
         f"{[int(s) for s in w['pe_strikes']]}"
     )
 
+    # Delta-adjusted turnover-proxy ranking across the widest chain response.
+    st.subheader("Expiry Turnover Ranking — |Delta| × LTP × Volume")
+    turnover_df = r["turnover_df"]
+    st.caption(
+        "Ranked across the widest FYERS option-chain response (up to 50 strikes "
+        "above and 50 below ATM). This is a proxy: latest LTP × cumulative "
+        "volume × |delta|, not exchange-reported traded turnover."
+    )
+
+    if turnover_df.empty:
+        st.warning(
+            "FYERS did not return usable LTP, cumulative volume and delta together "
+            "for the option contracts, so no turnover ranks can be calculated yet."
+        )
+    else:
+        top3 = turnover_df.head(3)
+        top3_ce = int((top3["Type"] == "CE").sum())
+        top3_pe = int((top3["Type"] == "PE").sum())
+        leader = top3.iloc[0]
+        m = st.columns(3)
+        m[0].metric("CE contracts in Top 3", str(top3_ce))
+        m[1].metric("PE contracts in Top 3", str(top3_pe))
+        m[2].metric(
+            "Rank #1 Contract",
+            f"{leader['Type']} {leader['Strike']:,.0f}",
+        )
+
+        # Group the actual Top-3 ranked contracts by their reported Type.
+        # Only CE-ranked rows enter the CE average; only PE-ranked rows enter PE.
+        top3_contracts = r["top3_contracts"]
+        st.caption(
+            "The averages use only the exact Top 3 ranked contracts, grouped by Type: "
+            "CE-ranked contracts contribute to the CE average, and PE-ranked "
+            "contracts contribute to the PE average. A strike contributes to "
+            "both sides only if both its CE and PE contracts are separately in the Top 3."
+        )
+        avg_cols = st.columns(2)
+        top3_avg_ce = r["top3_avg_ce"]
+        top3_avg_pe = r["top3_avg_pe"]
+        avg_cols[0].metric(
+            "Top-3 CE Contracts Avg Dev × |Delta| %",
+            f"{top3_avg_ce:+,.2f}%" if top3_avg_ce is not None else "N/A",
+        )
+        avg_cols[1].metric(
+            "Top-3 PE Contracts Avg Dev × |Delta| %",
+            f"{top3_avg_pe:+,.2f}%" if top3_avg_pe is not None else "N/A",
+        )
+        if top3_avg_ce is None or top3_avg_pe is None:
+            st.info(
+                "Waiting for valid WebSocket LTP/ATP and delta data for one "
+                "or more Top-3 contracts of that type. An average is shown "
+                "only when all Top-3 contracts of that type have valid data."
+            )
+
+        if not r["top3_deviation_df"].empty:
+            st.write("**Deviation calculation for each actual Top-3 ranked contract:**")
+            top3_fmt = {
+                "Strike": "{:,.0f}",
+                "LTP": "{:,.2f}",
+                "ATP": "{:,.2f}",
+                "|Delta|": "{:.4f}",
+                "Dev %": "{:+.2f}%",
+                "Dev × |Delta| %": "{:+.2f}%",
+            }
+            st.dataframe(
+                r["top3_deviation_df"].style.format(
+                    top3_fmt,
+                    na_rep="N/A",
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
+        if top3_ce == 3:
+            st.info("Top 3 are all CE contracts.")
+        elif top3_pe == 3:
+            st.info("Top 3 are all PE contracts.")
+        elif top3_ce > top3_pe:
+            st.info(f"Top 3 lean CE: {top3_ce} CE and {top3_pe} PE contracts.")
+        elif top3_pe > top3_ce:
+            st.info(f"Top 3 lean PE: {top3_pe} PE and {top3_ce} CE contracts.")
+        else:
+            st.info("Top 3 are split evenly between CE and PE contracts.")
+
+        display_columns = [
+            "Rank", "Strike", "Type", "LTP", "Volume", "|Delta|",
+            "|Delta| × LTP × Volume",
+        ]
+        display_df = turnover_df[display_columns]
+        fmt = {
+            "Strike": "{:,.0f}",
+            "LTP": "{:,.2f}",
+            "Volume": "{:,.0f}",
+            "|Delta|": "{:.4f}",
+            "|Delta| × LTP × Volume": "{:,.2f}",
+        }
+        st.write("**Top 10 contracts, ranked highest to lowest:**")
+        st.dataframe(
+            display_df.head(10).style.format(fmt),
+            width="stretch",
+            hide_index=True,
+        )
+        with st.expander(f"View complete ranking ({len(turnover_df)} contracts)"):
+            st.dataframe(
+                display_df.style.format(fmt),
+                width="stretch",
+                hide_index=True,
+            )
+
     # PCR and OI change metrics
     oi = r["oi_metrics"]
 
@@ -901,6 +1264,17 @@ def render(r):
 
         st.latex(
             r"NetOIChange=\sum PE\ oich-\sum CE\ oich"
+        )
+
+        st.latex(
+            r"DeltaAdjustedActivity_K=|Delta_K|\times LTP_K\times Volume_K"
+        )
+
+        st.write(
+            "The turnover ranking is a proxy because latest LTP is multiplied "
+            "by cumulative traded volume. FYERS option-chain requests return "
+            "at most 50 strikes on either side of ATM, so contracts beyond "
+            "that returned range are not included. "
         )
 
         st.write(
