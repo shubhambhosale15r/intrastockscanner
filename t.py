@@ -18,7 +18,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 # ---------------------------------------------------------------------------
-# Fyers WebSocket Manager (Referenced from nifty.py)
+# Fyers WebSocket Manager
 # ---------------------------------------------------------------------------
 
 class MarketWSManager:
@@ -30,8 +30,9 @@ class MarketWSManager:
         self.running = False
         self.ws_thread = None
         self.lock = threading.RLock()
-        
-        # In-memory store for live quotes: {symbol: {"lp": float, "atp": float, "bid": float, "ask": float, "volume": int, "time": float}}
+
+        # In-memory store for live quotes:
+        # {symbol: {"lp": float, "atp": float, "bid": float, "ask": float, "volume": int, "time": float}}
         self.live_quotes = {}
 
     def on_message(self, message):
@@ -39,17 +40,17 @@ class MarketWSManager:
         if symbol:
             with self.lock:
                 q = self.live_quotes.setdefault(symbol, {})
-                
+
                 # Extract LTP (supporting both 'lp' and 'ltp')
                 ltp = message.get("lp") if message.get("lp") is not None else message.get("ltp")
                 if ltp is not None:
                     q["lp"] = float(ltp)
-                
+
                 # Extract ATP (supporting 'avg_trade_price' and 'atp')
                 atp = message.get("avg_trade_price") if message.get("avg_trade_price") is not None else message.get("atp")
                 if atp is not None:
                     q["atp"] = float(atp)
-                
+
                 if message.get("bid") is not None:
                     q["bid"] = float(message.get("bid"))
                 if message.get("ask") is not None:
@@ -58,7 +59,7 @@ class MarketWSManager:
                     q["volume"] = int(message.get("vol_traded_today"))
                 elif message.get("volume") is not None:
                     q["volume"] = int(message.get("volume"))
-                
+
                 q["time"] = time.time()
 
     def on_error(self, msg):
@@ -107,14 +108,19 @@ class MarketWSManager:
             return
         now = time.time()
         with self.lock:
+            ok = True
             if self.ws:
                 try:
                     self.ws.subscribe(list(new_symbols), "SymbolUpdate")
                 except Exception:
-                    pass
-            self.subscribed.update(new_symbols)
-            for s in new_symbols:
-                self.subscribed_at.setdefault(s, now)
+                    # Do not mark as subscribed; retry on the next refresh.
+                    ok = False
+            if ok:
+                self.subscribed.update(new_symbols)
+                for s in new_symbols:
+                    self.subscribed_at.setdefault(s, now)
+        # NOTE: on_open() re-subscribes everything in self.subscribed after
+        # a (re)connect.
 
     def stop(self):
         self.running = False
@@ -128,11 +134,11 @@ class MarketWSManager:
 
     def get_quote(self, symbol):
         with self.lock:
-            return self.live_quotes.get(symbol, {})
+            return dict(self.live_quotes.get(symbol, {}))
 
 
 # ---------------------------------------------------------------------------
-# Fyers REST API (for Option Chain structure, greeks, and expiries)
+# Fyers REST API (Option Chain structure, greeks, expiries, quote fallback)
 # ---------------------------------------------------------------------------
 
 def fetch_chain(fyers, symbol, strikecount, expiry=0):
@@ -162,6 +168,29 @@ def fetch_quotes(ws_manager, symbols):
     return quotes
 
 
+def fetch_rest_quotes(fyers, symbols):
+    """REST fallback: {symbol: {lp, atp, bid, ask, volume}}."""
+    out = {}
+    if not symbols:
+        return out
+    try:
+        resp = fyers.quotes(data={"symbols": ",".join(symbols)})
+    except Exception:
+        return out
+    if not isinstance(resp, dict):
+        return out
+    for item in resp.get("d", []) or []:
+        v = item.get("v", {}) or {}
+        out[item.get("n")] = {
+            "lp": v.get("lp"),
+            "atp": v.get("atp"),
+            "bid": v.get("bid"),
+            "ask": v.get("ask"),
+            "volume": v.get("volume"),
+        }
+    return out
+
+
 def fetch_spot(ws_manager, symbol):
     q = ws_manager.get_quote(symbol)
     lp = q.get("lp")
@@ -181,6 +210,16 @@ def is_num(x):
         return x is not None and math.isfinite(float(x))
     except (TypeError, ValueError):
         return False
+
+
+def quote_ok(q):
+    """True when a quote has a usable LTP and a positive ATP."""
+    return bool(
+        q
+        and is_num(q.get("lp"))
+        and is_num(q.get("atp"))
+        and float(q["atp"]) > 0
+    )
 
 
 def expiry_label(item):
@@ -592,11 +631,10 @@ def delta_adjusted_avg(df, leg):
 def top3_contract_deviation_table(top3_contracts, option_map, quotes, delta_map):
     """Calculate LTP-ATP deviations only for the actual Top-3 contracts.
 
-    First inspect each ranked contract's Type. A CE row contributes only to
-    the CE average; a PE row contributes only to the PE average. If the same
-    strike appears as both CE and PE in the Top 3, each contract contributes
-    to its own side's average. Strikes/contracts outside the Top 3 are not
-    included.
+    A CE row contributes only to the CE average; a PE row contributes only to
+    the PE average. If the same strike appears as both CE and PE in the Top 3,
+    each contract contributes to its own side's average. Contracts outside the
+    Top 3 are not included.
     """
     result_rows = []
     ce_values = []
@@ -645,12 +683,25 @@ def top3_contract_deviation_table(top3_contracts, option_map, quotes, delta_map)
             else:
                 pe_values.append(adjusted)
         else:
+            # Work out exactly what is missing so the Status column is useful.
+            reasons = []
+            if not is_num(lp):
+                reasons.append("LTP missing")
+            if not is_num(atp):
+                reasons.append("ATP missing")
+            elif float(atp) <= 0:
+                reasons.append("ATP is 0")
+            if not is_num(delta):
+                reasons.append("delta missing")
+            if symbol is None:
+                reasons.append("symbol missing")
+
             lp = float(lp) if is_num(lp) else None
             atp = float(atp) if is_num(atp) else None
             abs_delta = abs(float(delta)) if is_num(delta) else None
             dev = None
             adjusted = None
-            status = "Waiting for valid WebSocket LTP/ATP or delta"
+            status = "Waiting: " + ", ".join(reasons) if reasons else "Waiting for data"
             if leg == "CE":
                 ce_complete = False
             elif leg == "PE":
@@ -701,8 +752,6 @@ def compute(ws_manager, fyers, underlying, strikecount, expiry):
     turnover_df = build_turnover_table(chain_rows)
 
     # Use the exact Top-3 ranked contracts, preserving each contract's CE/PE type.
-    # A strike may appear twice (once as CE and once as PE), and each entry
-    # contributes only to the average for its own option type.
     full_option_map = build_option_map(chain_rows)
     full_delta_map = build_delta_map(chain_rows)
     top3_contracts = (
@@ -732,8 +781,7 @@ def compute(ws_manager, fyers, underlying, strikecount, expiry):
         spot = float(spot)
 
     # Keep the existing signal and OI calculations restricted to the selected
-    # number of strikes on either side of the spot/ATM; turnover ranking uses
-    # the widest chain response above.
+    # number of strikes on either side of the spot/ATM.
     rows = select_signal_rows(chain_rows, spot, strikecount)
     delta_map = build_delta_map(rows)
     option_map = build_option_map(rows)
@@ -821,6 +869,18 @@ def compute(ws_manager, fyers, underlying, strikecount, expiry):
     # Refresh only the exact Top-3 ranked contracts. Each row's Type decides
     # which average it contributes to (CE rows -> CE average, PE rows -> PE average).
     quotes.update(fetch_quotes(ws_manager, top3_symbols))
+
+    # REST fallback for any Top-3 contract still missing a usable LTP/ATP.
+    missing = [s for s in top3_symbols if not quote_ok(quotes.get(s))]
+    if missing:
+        rest = fetch_rest_quotes(fyers, missing)
+        for s in missing:
+            r_q = rest.get(s) or {}
+            cur = quotes.setdefault(s, {})
+            for k in ("lp", "atp", "bid", "ask", "volume"):
+                if not is_num(cur.get(k)) and is_num(r_q.get(k)):
+                    cur[k] = r_q[k]
+
     top3_deviation_df, top3_avg_ce, top3_avg_pe = top3_contract_deviation_table(
         top3_contracts,
         full_option_map,
@@ -913,15 +973,15 @@ def render(r):
         f"({count} strikes, step {int(step)}) [WebSocket Feed Live]"
     )
 
-    # ---------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # ALERT & HISTORY TRACKING LOGIC
-    # ---------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     if "alert_history" not in st.session_state:
         st.session_state.alert_history = []
 
     avg_ce = r["avg_ce"]
     avg_pe = r["avg_pe"]
-    
+
     val_ce_int = int(abs(avg_ce))
     val_pe_int = int(abs(avg_pe))
 
@@ -952,7 +1012,7 @@ def render(r):
             f"• **Avg CE Dev × |Delta|:** {last_match['avg_ce']:+.2f}% (Integer Value: {int(abs(last_match['avg_ce']))})  \n"
             f"• **Avg PE Dev × |Delta|:** {last_match['avg_pe']:+.2f}% (Integer Value: {int(abs(last_match['avg_pe']))})"
         )
-        
+
         with st.expander("View Full Match History Log"):
             history_df = pd.DataFrame([
                 {
@@ -1052,8 +1112,6 @@ def render(r):
         )
 
         # Group the actual Top-3 ranked contracts by their reported Type.
-        # Only CE-ranked rows enter the CE average; only PE-ranked rows enter PE.
-        top3_contracts = r["top3_contracts"]
         st.caption(
             "The averages use only the exact Top 3 ranked contracts, grouped by Type: "
             "CE-ranked contracts contribute to the CE average, and PE-ranked "
@@ -1065,17 +1123,26 @@ def render(r):
         top3_avg_pe = r["top3_avg_pe"]
         avg_cols[0].metric(
             "Top-3 CE Contracts Avg Dev × |Delta| %",
-            f"{top3_avg_ce:+,.2f}%" if top3_avg_ce is not None else "N/A",
+            f"{top3_avg_ce:+,.2f}%" if top3_avg_ce is not None
+            else ("No CE in Top 3" if top3_ce == 0 else "N/A"),
         )
         avg_cols[1].metric(
             "Top-3 PE Contracts Avg Dev × |Delta| %",
-            f"{top3_avg_pe:+,.2f}%" if top3_avg_pe is not None else "N/A",
+            f"{top3_avg_pe:+,.2f}%" if top3_avg_pe is not None
+            else ("No PE in Top 3" if top3_pe == 0 else "N/A"),
         )
-        if top3_avg_ce is None or top3_avg_pe is None:
+
+        # Only warn when a type that IS present in the Top 3 lacks valid data.
+        waiting = (
+            (top3_ce > 0 and top3_avg_ce is None)
+            or (top3_pe > 0 and top3_avg_pe is None)
+        )
+        if waiting:
             st.info(
                 "Waiting for valid WebSocket LTP/ATP and delta data for one "
                 "or more Top-3 contracts of that type. An average is shown "
-                "only when all Top-3 contracts of that type have valid data."
+                "only when all Top-3 contracts of that type have valid data. "
+                "See the Status column below for the exact missing field."
             )
 
         if not r["top3_deviation_df"].empty:
@@ -1212,11 +1279,11 @@ def render(r):
         raw = pd.DataFrame([
             {
                 "Symbol": symbol,
-                "LTP": quote["lp"],
-                "ATP": quote["atp"],
-                "Bid": quote["bid"],
-                "Ask": quote["ask"],
-                "Volume": quote["volume"],
+                "LTP": quote.get("lp"),
+                "ATP": quote.get("atp"),
+                "Bid": quote.get("bid"),
+                "Ask": quote.get("ask"),
+                "Volume": quote.get("volume"),
             }
             for symbol, quote in r["quotes"].items()
         ])
@@ -1360,7 +1427,7 @@ def main():
     if "ws_manager" not in st.session_state or st.session_state.get("token") != access_token:
         if "ws_manager" in st.session_state:
             st.session_state.ws_manager.stop()
-        
+
         ws_mgr = MarketWSManager(access_token)
         ws_mgr.start()
         st.session_state.ws_manager = ws_mgr
@@ -1381,11 +1448,11 @@ def main():
             underlying,
             strikecount,
         )
-        
+
         expiries = (
             expiry_response.get("data", {}).get("expiryData", [])
         )
-        
+
         if not expiries:
             raise RuntimeError(
                 f"No expiry data returned by Fyers: {expiry_response}"
