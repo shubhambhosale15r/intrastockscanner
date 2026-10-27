@@ -1,1 +1,1 @@
-https://optionchainfyers.streamlit.app/
+https://intrastockscanner.streamlit.app/
