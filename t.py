@@ -1,8 +1,12 @@
-"""NIFTY OTM CE/PE LTP - ATP + OI/PCR signal (Fyers WebSocket + Streamlit + Alerts).
-Display only, no orders.
+"""NIFTY 500 relative-strength scanner (Fyers WebSocket + Streamlit).
+
+Subscribes to the NIFTY 500 index and its constituents over the Fyers data
+socket, then ranks stocks by (stock % change - NIFTY 500 % change) so you can
+see the top 3 outperformers and top 3 underperformers live. Display only.
+
+Run:  streamlit run t.py
 """
 
-import math
 import threading
 import time
 from datetime import datetime
@@ -10,73 +14,137 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
 from streamlit_autorefresh import st_autorefresh
 
 IST = ZoneInfo("Asia/Kolkata")
+INDEX_SYMBOL = "NSE:NIFTY500-INDEX"
+INDEX_NAME = "NIFTY 500"
+TOP_N = 3
+STALE_AFTER_S = 15
+
+_TICKER_TEXT = """
+360ONE ABB ACC ACMESOLAR AIAENG APLAPOLLO AUBANK AWL AADHARHFC AARTIIND AAVAS
+ABBOTINDIA ACE ACUTAAS ADANIENSOL ADANIENT ADANIGREEN ADANIPORTS ADANIPOWER ATGL
+ABCAPITAL ABREL ABSLAMC CPPLUS AEGISLOG AEGISVOPAK AETHER AFCONS AFFLE AJANTPHARM
+ALKEM ABDL ARE&M AMBER AMBUJACEM ANANDRATHI ANANTRAJ ANGELONE ANTHEM ANURAS
+APARINDS APOLLOHOSP APOLLOTYRE APTUS ASAHIINDIA ASHOKLEY ASIANPAINT ASTERDM ASTRAL
+ATHERENERG ATUL AUROPHARMA AIIL AVANTIFEED DMART AXISBANK AZAD BEML BLS BSE BAGMANE
+BAJAJ-AUTO BAJFINANCE BAJAJFINSV BAJAJHLDNG BAJAJHFL BALKRISIND BALRAMCHIN
+BANDHANBNK BANKBARODA BANKINDIA MAHABANK BATAINDIA BELRISE BERGEPAINT BHARATCOAL
+BDL BEL BHARATFORG BHEL BPCL BHARTIARTL BHARTIHEXA GROWW BIOCON BSOFT BBOX
+BLUESTARCO BOSCHLTD FIRSTCRY BRIGADE BRITANNIA BIRET CCL CESC CGPOWER CIEINDIA
+CRISIL CANFINHOME CANBK CANHLIFE CAPLIPOINT CGCL CARBORUNIV CARTRADE CASTROLIND
+CEATLTD CEMPRO CENTRALBK CDSL CMPDI CHAMBLFERT CHENNPETRO CHOICEIN CHOLAHLDNG
+CHOLAFIN CIPLA CUB CLEANMAX CLEAN COALINDIA COCHINSHIP COFORGE COHANCE COLPAL CAMS
+CONCORDBIO CONCOR COROMANDEL CRAFTSMAN CREDITACC CROMPTON CUMMINSIND CUPID CYIENT
+DLF DOMS DABUR DALBHARAT DATAPATTNS DEEPAKFERT DEEPAKNTR DELHIVERY DEVYANI
+DIVISLAB DIXON LALPATHLAB DRREDDY EIDPARRY EIHOTEL EMBASSY EICHERMOT ELECON
+ELGIEQUIP EMAMILTD EMCURE EMMVEE ENDURANCE ENGINERSIN ESCORTS ETERNAL EXIDEIND
+NYKAA FEDERALBNK FACT FINCABLES FSL FIVESTAR FORCEMOT FORTIS FRACTAL GAIL GVT&D
+GMRAIRPORT GABRIEL GALLANTT GRSE GICRE GILLETTE GLAND GLAXO GLENMARK MEDANTA GPIL
+GODFRYPHLP GODREJCP GODREJIND GODREJPROP GRANULES GRAPHITE GRASIM GRAVITA GESHIP
+FLUOROCHEM GMDCLTD HBLENGINE HCLTECH HDBFS HDFCAMC HDFCBANK HDFCLIFE HEGAM HFCL
+HAVELLS HEROMOTOCO HEXT HSCL HINDALCO HAL HINDCOPPER HINDPETRO HINDUNILVR HINDZINC
+POWERINDIA HOMEFIRST HONASA HONAUT HUDCO HYUNDAI ICICIBANK ICICILIFE ICICIGI
+ICICIAMC IDBI IDFCFIRSTB IFCI IIFL INOXINDIA IRB IRCON ITCHOTELS ITC ITI INDIACEM
+INDIAMART INDIANB IEX INDHOTEL IOC IOB IRCTC IRFC IREDA IGL INDUSTOWER INDUSINDBK
+NAUKRI INFY INOXWIND INTELLECT INDIGO IGIL IKS IPCALAB JKCEMENT JBMA JKTYRE
+JMFINANCIL JSWCEMENT JSWENERGY JSWINFRA JSWSTEEL JAINREC JPPOWER J&KBANK
+JINDALSAW JSL JINDALSTEL JIOFIN JUBLFOOD JUBLINGREA JWL JYOTICNC KPRMILL KEI
+KPITTECH KSB KAJARIACER KPIL KALYANKJIL KARURVYSYA KAYNES KEC KFINTECH KIRLOSBROS
+KIRLOSENG KOTAKBANK KIMS LTF LTTS LGEINDIA LICHSGFIN LTFOODS LTM LT LAURUSLABS
+LEMONTREE LENSKART LICI LINDEINDIA LLOYDSME LODHA LUPIN MMTC MRF MTARTECH MGL
+M&MFIN M&M MANAPPURAM MRPL MANKIND MARICO MARUTI MFSL MAXHEALTH MAZDOCK MEESHO
+MINDACORP MSUMI MOTILALOFS MPHASIS MCX MUTHOOTFIN NATCOPHARM NBCC NCC NHPC
+NLCINDIA NMDC NSLNISP NTPCGREEN NTPC NH NATIONALUM NAVA NAVINFLUOR NESTLEIND
+NETWEB NEULANDLAB NAM-INDIA NUVAMA NUVOCO OBEROIRLTY ONGC OIL OLAELEC OLECTRA
+PAYTM ONESOURCE OFSS POLICYBZR PCBL PGEL PIIND PNBHOUSING PTCIL PVRINOX PAGEIND
+PARADEEP PATANJALI PERSISTENT PETRONET PHOENIXLTD PWL PIDILITIND PINELABS
+PIRAMALFIN PPLPHARMA POLYMED POLYCAB POONAWALLA PFC POWERGRID PREMIERENE PRESTIGE
+PFOCUS PRIVISCL PNB RRKABEL RBLBANK RECLTD RHIM RITES RADICO RVNL RAILTEL RAINBOW
+RKFORGE REDINGTON RELIANCE RPOWER RUBICON SBICARD SBILIFE SJVN SHRIPISTON SRF
+SAGILITY SAILIFE SAMMAANCAP MOTHERSON SANSERA SARDAEN SCHAEFFLER SCHNEIDER SCI
+SHREECEM SHRIRAMFIN SHYAMMETL ENRIN SIEMENS SIGNATURE SOBHA SOLARINDS SONACOMS
+STARHEALTH SBIN SAIL STLTECH SUMICHEM SUNPHARMA SUNTV SUNDARMFIN SUPREMEIND SUZLON
+SWANCORP SWIGGY SYNGENE SYRMA TBOTEK TDPOWERSYS TVSMOTOR TATACAP TATACHEM TATACOMM
+TCS TATACONSUM TATAELXSI TATAINVEST TMCV TMPV TATAPOWER TATASTEEL TATATECH TTML
+TECHM TECHNOE TEGA TEJASNET TENNIND THANGAMAYL NIACL RAMCOCEM THERMAX TIMKEN
+TITAGARH TITAN TORNTPHARM TORNTPOWER TARIL TRENT TRIDENT TRITURBINE TIINDIA
+UCOBANK UNOMINDA UPL UTIAMC ULTRACEMCO UNIONBANK UBL UNITDSPR URBANCO USHAMART VTL
+VBL VAML VISL VEDL VOGL VEDPOWER VIJAYA VMM IDEA VOLTAS WAAREEENER WELCORP
+WELSPUNLIV WHIRLPOOL WIPRO WOCKPHARMA YESBANK ZFCVINDIA ZEEL ZENTEC ZENSARTECH
+ZYDUSLIFE ZYDUSWELL ECLERX
+"""
+TICKERS = list(dict.fromkeys(_TICKER_TEXT.split()))
+
+# Some instruments trade in a series other than EQ (e.g. REITs). Add overrides
+# here as "TICKER": "SERIES" if a symbol never ticks. Example: {"EMBASSY": "RR"}
+SERIES_OVERRIDE = {}
+SYMBOLS = {t: f"NSE:{t}-{SERIES_OVERRIDE.get(t, 'EQ')}" for t in TICKERS}
 
 
-# ---------------------------------------------------------------------------
-# Fyers WebSocket Manager
-# ---------------------------------------------------------------------------
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
 
 class MarketWSManager:
-    def __init__(self, access_token):
+    def __init__(self, access_token, symbols):
         self.access_token = access_token
+        self.symbols = list(dict.fromkeys(symbols))
         self.ws = None
-        self.subscribed = set()
-        self.subscribed_at = {}
-        self.running = False
         self.ws_thread = None
+        self.running = False
+        self.connected = False
+        self.last_error = None
         self.lock = threading.RLock()
-
-        # In-memory store for live quotes:
-        # {symbol: {"lp": float, "atp": float, "bid": float, "ask": float, "volume": int, "time": float}}
         self.live_quotes = {}
 
     def on_message(self, message):
-        symbol = message.get("symbol") or message.get("n")
-        if symbol:
-            with self.lock:
-                q = self.live_quotes.setdefault(symbol, {})
-
-                # Extract LTP (supporting both 'lp' and 'ltp')
-                ltp = message.get("lp") if message.get("lp") is not None else message.get("ltp")
-                if ltp is not None:
-                    q["lp"] = float(ltp)
-
-                # Extract ATP (supporting 'avg_trade_price' and 'atp')
-                atp = message.get("avg_trade_price") if message.get("avg_trade_price") is not None else message.get("atp")
-                if atp is not None:
-                    q["atp"] = float(atp)
-
-                if message.get("bid") is not None:
-                    q["bid"] = float(message.get("bid"))
-                if message.get("ask") is not None:
-                    q["ask"] = float(message.get("ask"))
-                if message.get("vol_traded_today") is not None:
-                    q["volume"] = int(message.get("vol_traded_today"))
-                elif message.get("volume") is not None:
-                    q["volume"] = int(message.get("volume"))
-
-                q["time"] = time.time()
+        if not isinstance(message, dict):
+            return
+        symbol = message.get("symbol")
+        if not symbol:
+            return  # connection / subscribe acknowledgements
+        ltp = _num(message.get("ltp"))
+        prev = _num(message.get("prev_close_price"))
+        chp = _num(message.get("chp"))
+        ch = _num(message.get("ch"))
+        with self.lock:
+            q = self.live_quotes.setdefault(symbol, {})
+            if ltp is not None:
+                q["ltp"] = ltp
+            if prev is not None and prev > 0:
+                q["prev"] = prev
+            if ch is not None:
+                q["ch"] = ch
+            if chp is not None:
+                q["chp"] = chp
+            elif q.get("ltp") is not None and q.get("prev"):
+                q["chp"] = (q["ltp"] - q["prev"]) / q["prev"] * 100
+            vol = _num(message.get("vol_traded_today"))
+            if vol is not None:
+                q["volume"] = int(vol)
+            q["time"] = time.time()
 
     def on_error(self, msg):
-        pass
+        self.last_error = str(msg)
 
     def on_close(self, msg):
-        pass
+        self.connected = False
 
     def on_open(self):
-        with self.lock:
-            if self.subscribed and self.ws:
-                try:
-                    self.ws.subscribe(list(self.subscribed), "SymbolUpdate")
-                except Exception:
-                    pass
-        if self.ws:
-            self.ws.keep_running()
+        self.connected = True
+        try:
+            # Subscribe in chunks to keep each request small.
+            for i in range(0, len(self.symbols), 100):
+                self.ws.subscribe(self.symbols[i:i + 100], "SymbolUpdate")
+        except Exception as e:
+            self.last_error = f"subscribe failed: {e}"
+        self.ws.keep_running()
 
     def _ws_connect(self):
         try:
@@ -89,11 +157,11 @@ class MarketWSManager:
                 on_connect=self.on_open,
                 on_close=self.on_close,
                 on_error=self.on_error,
-                on_message=self.on_message
+                on_message=self.on_message,
             )
             self.ws.connect()
-        except Exception:
-            pass
+        except Exception as e:
+            self.last_error = str(e)
 
     def start(self):
         if self.running:
@@ -102,26 +170,6 @@ class MarketWSManager:
         self.ws_thread = threading.Thread(target=self._ws_connect, daemon=True)
         self.ws_thread.start()
 
-    def subscribe(self, symbols):
-        new_symbols = set(symbols) - self.subscribed
-        if not new_symbols:
-            return
-        now = time.time()
-        with self.lock:
-            ok = True
-            if self.ws:
-                try:
-                    self.ws.subscribe(list(new_symbols), "SymbolUpdate")
-                except Exception:
-                    # Do not mark as subscribed; retry on the next refresh.
-                    ok = False
-            if ok:
-                self.subscribed.update(new_symbols)
-                for s in new_symbols:
-                    self.subscribed_at.setdefault(s, now)
-        # NOTE: on_open() re-subscribes everything in self.subscribed after
-        # a (re)connect.
-
     def stop(self):
         self.running = False
         if self.ws:
@@ -129,1360 +177,141 @@ class MarketWSManager:
                 self.ws.close_connection()
             except Exception:
                 pass
-        if self.ws_thread and self.ws_thread.is_alive():
-            self.ws_thread.join(timeout=2)
 
-    def get_quote(self, symbol):
+    def snapshot(self):
         with self.lock:
-            return dict(self.live_quotes.get(symbol, {}))
+            return {k: dict(v) for k, v in self.live_quotes.items()}
 
 
-# ---------------------------------------------------------------------------
-# Fyers REST API (Option Chain structure, greeks, expiries, quote fallback)
-# ---------------------------------------------------------------------------
-
-def fetch_chain(fyers, symbol, strikecount, expiry=0):
-    return fyers.optionchain(data={
-        "symbol": symbol,
-        "strikecount": int(strikecount),
-        "timestamp": int(expiry),
-        "greeks": "1",
-    })
-
-
-def fetch_quotes(ws_manager, symbols):
-    """Return {symbol: {lp, atp, bid, ask, volume}} from WebSocket in-memory cache."""
-    symbols = list(dict.fromkeys(symbols))
-    quotes = {}
-
-    for symbol in symbols:
-        q = ws_manager.get_quote(symbol)
-        quotes[symbol] = {
-            "lp": q.get("lp"),
-            "atp": q.get("atp"),
-            "bid": q.get("bid"),
-            "ask": q.get("ask"),
-            "volume": q.get("volume"),
-        }
-
-    return quotes
-
-
-def fetch_rest_quotes(fyers, symbols):
-    """REST fallback: {symbol: {lp, atp, bid, ask, volume}}."""
-    out = {}
-    if not symbols:
-        return out
-    try:
-        resp = fyers.quotes(data={"symbols": ",".join(symbols)})
-    except Exception:
-        return out
-    if not isinstance(resp, dict):
-        return out
-    for item in resp.get("d", []) or []:
-        v = item.get("v", {}) or {}
-        out[item.get("n")] = {
-            "lp": v.get("lp"),
-            "atp": v.get("atp"),
-            "bid": v.get("bid"),
-            "ask": v.get("ask"),
-            "volume": v.get("volume"),
-        }
-    return out
-
-
-def fetch_spot(ws_manager, symbol):
-    q = ws_manager.get_quote(symbol)
-    lp = q.get("lp")
-
-    if not is_num(lp):
-        raise RuntimeError(f"Spot LTP unavailable via WebSocket for {symbol}")
-
-    return float(lp)
-
-
-# ---------------------------------------------------------------------------
-# General helpers
-# ---------------------------------------------------------------------------
-
-def is_num(x):
-    try:
-        return x is not None and math.isfinite(float(x))
-    except (TypeError, ValueError):
-        return False
-
-
-def quote_ok(q):
-    """True when a quote has a usable LTP and a positive ATP."""
-    return bool(
-        q
-        and is_num(q.get("lp"))
-        and is_num(q.get("atp"))
-        and float(q["atp"]) > 0
-    )
-
-
-def expiry_label(item):
-    return str(
-        item.get("expiryDate")
-        or item.get("date")
-        or item.get("expiry")
-        or "Unknown"
-    )
-
-
-def expiry_value(item):
-    if item.get("expiry") is not None:
-        return int(item["expiry"])
-    return item.get("expiryDate")
-
-
-# ---------------------------------------------------------------------------
-# Option-chain helpers
-# ---------------------------------------------------------------------------
-
-def build_option_map(rows):
-    """Build {strike: {'CE': symbol, 'PE': symbol}}."""
-    option_map = {}
-
-    for row in rows:
-        kind = row.get("option_type")
-        symbol = (
-            row.get("symbol")
-            or row.get("name")
-            or row.get("original_name")
-        )
-
-        try:
-            strike = float(row.get("strike_price"))
-        except (TypeError, ValueError):
-            continue
-
-        if kind in ("CE", "PE") and symbol:
-            option_map.setdefault(strike, {})[kind] = symbol
-
-    return option_map
-
-
-def build_delta_map(rows):
-    """Build {(strike, option_type): absolute delta} from option-chain rows."""
-    delta_map = {}
-
-    for row in rows:
-        kind = row.get("option_type")
-        if kind not in ("CE", "PE"):
-            continue
-
-        try:
-            strike = float(row.get("strike_price"))
-        except (TypeError, ValueError):
-            continue
-
-        greeks = row.get("greeks")
-        if not isinstance(greeks, dict):
-            greeks = {}
-
-        delta = greeks.get("delta")
-        if not is_num(delta):
-            delta = row.get("delta")
-
-        if is_num(delta):
-            delta_map[(strike, kind)] = abs(float(delta))
-
-    return delta_map
-
-
-def build_oi_map(rows):
-    """Build {(strike, leg): {'oi': value, 'oich': value}}."""
-    oi_map = {}
-
-    for row in rows:
-        kind = row.get("option_type")
-
-        if kind not in ("CE", "PE"):
-            continue
-
-        try:
-            strike = float(row.get("strike_price"))
-        except (TypeError, ValueError):
-            continue
-
-        oi_map[(strike, kind)] = {
-            "oi": row.get("oi"),
-            "oich": row.get("oich"),
-        }
-
-    return oi_map
-
-
-# ---------------------------------------------------------------------------
-# Delta-adjusted turnover-proxy ranking
-# ---------------------------------------------------------------------------
-
-def first_valid_number(row, keys):
-    """Return the first finite numeric value found under the supplied keys."""
-    for key in keys:
-        value = row.get(key)
-        if is_num(value):
-            return float(value)
-    return None
-
-
-def build_turnover_table(rows):
-    """Rank returned CE/PE contracts by |delta| * LTP * cumulative volume.
-
-    This is a delta-adjusted activity/turnover proxy, not exchange-reported
-    traded turnover: latest LTP is multiplied by the day's cumulative volume.
-    """
-    ranked_rows = []
-
-    for row in rows:
-        kind = row.get("option_type")
-        if kind not in ("CE", "PE"):
-            continue
-
-        try:
-            strike = float(row.get("strike_price"))
-        except (TypeError, ValueError):
-            continue
-
-        greeks = row.get("greeks")
-        if not isinstance(greeks, dict):
-            greeks = {}
-
-        delta = first_valid_number(
-            {"greeks_delta": greeks.get("delta"), "delta": row.get("delta")},
-            ("greeks_delta", "delta"),
-        )
-        ltp_value = first_valid_number(row, ("ltp", "lp"))
-        volume = first_valid_number(
-            row,
-            ("volume", "vol_traded_today", "v", "volumeTradedToday"),
-        )
-
-        # Contracts with missing required fields cannot be ranked reliably.
-        if delta is None or ltp_value is None or volume is None:
-            continue
-        if ltp_value < 0 or volume < 0:
-            continue
-
-        symbol = (
-            row.get("symbol")
-            or row.get("name")
-            or row.get("original_name")
-            or row.get("ex_symbol")
-            or ""
-        )
-        abs_delta = abs(delta)
-        proxy = abs_delta * ltp_value * volume
-
-        ranked_rows.append({
-            "Strike": strike,
-            "Type": kind,
-            "Symbol": symbol,
-            "LTP": ltp_value,
-            "Volume": volume,
-            "|Delta|": abs_delta,
-            "|Delta| × LTP × Volume": proxy,
-        })
-
-    columns = [
-        "Rank", "Strike", "Type", "Symbol", "LTP", "Volume",
-        "|Delta|", "|Delta| × LTP × Volume",
-    ]
-    if not ranked_rows:
-        return pd.DataFrame(columns=columns)
-
-    df = pd.DataFrame(ranked_rows)
-    df = df.sort_values(
-        "|Delta| × LTP × Volume",
-        ascending=False,
-        kind="stable",
-    ).reset_index(drop=True)
-    df.insert(0, "Rank", range(1, len(df) + 1))
-    return df[columns]
-
-
-def get_chain_spot(rows):
-    """Best-effort spot extraction from the underlying row in option-chain data."""
-    for row in rows:
-        if row.get("option_type") in ("CE", "PE"):
-            continue
-        spot_value = first_valid_number(row, ("ltp", "lp", "fp"))
-        if spot_value is not None and spot_value > 0:
-            return spot_value
-    return None
-
-
-def select_signal_rows(rows, spot, strikecount):
-    """Keep the configured ATM +/- strikecount strikes for existing signal logic."""
-    option_rows = [row for row in rows if row.get("option_type") in ("CE", "PE")]
-    available_strikes = sorted({
-        float(row["strike_price"])
-        for row in option_rows
-        if is_num(row.get("strike_price"))
-    })
-    if len(available_strikes) < 3:
-        raise RuntimeError("Fewer than 3 option strikes returned by FYERS.")
-
-    centre = closest(available_strikes, spot)
-    centre_index = available_strikes.index(centre)
-    low = max(0, centre_index - int(strikecount))
-    high = min(len(available_strikes), centre_index + int(strikecount) + 1)
-    selected = set(available_strikes[low:high])
-
-    return [
-        row for row in option_rows
-        if is_num(row.get("strike_price"))
-        and float(row["strike_price"]) in selected
-    ]
-
-
-def closest(strikes, price):
-    return min(strikes, key=lambda s: abs(s - price))
-
-
-def three_around(strikes, centre, step):
-    """Centre strike and its two neighbours."""
-    if centre not in strikes:
-        raise RuntimeError(
-            f"Strike {centre:,.0f} is outside the loaded chain. "
-            "Increase Strike Count."
-        )
-
-    i = strikes.index(centre)
-
-    if i == 0 or i == len(strikes) - 1:
-        raise RuntimeError(
-            f"Strike {centre:,.0f} is at the chain edge. "
-            "Increase Strike Count."
-        )
-
-    window = strikes[i - 1:i + 2]
-
-    if any(b - a > step for a, b in zip(window, window[1:])):
-        raise RuntimeError(
-            f"Strikes {[int(s) for s in window]} are not adjacent. "
-            "Increase Strike Count."
-        )
-
-    return window
-
-
-# ---------------------------------------------------------------------------
-# OI calculations
-# ---------------------------------------------------------------------------
-
-def calculate_oi_metrics(oi_map, ce_strikes, pe_strikes):
-    """PCR and Net OI change calculations."""
-
-    def aggregate(strikes, leg, field):
-        values = []
-
-        for strike in strikes:
-            item = oi_map.get((strike, leg))
-
-            if item is None or not is_num(item.get(field)):
-                raise RuntimeError(
-                    f"Missing or invalid {field} for "
-                    f"{leg} strike {strike:,.0f} in option-chain response."
-                )
-
-            values.append(float(item[field]))
-
-        return sum(values)
-
-    ce_oi = aggregate(ce_strikes, "CE", "oi")
-    pe_oi = aggregate(pe_strikes, "PE", "oi")
-
-    ce_oich = aggregate(ce_strikes, "CE", "oich")
-    pe_oich = aggregate(pe_strikes, "PE", "oich")
-
-    return {
-        "ce_oi": ce_oi,
-        "pe_oi": pe_oi,
-        "pcr": pe_oi / ce_oi if ce_oi != 0 else None,
-        "ce_oich": ce_oich,
-        "pe_oich": pe_oich,
-        "net_oich": pe_oich - ce_oich,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Calculations
-# ---------------------------------------------------------------------------
-
-def ltp(quotes, symbol, what="LTP"):
-    q = quotes.get(symbol)
-
-    if not q or not is_num(q["lp"]):
-        raise RuntimeError(f"Invalid {what} for {symbol} (Waiting for WebSocket tick...)")
-
-    return float(q["lp"])
-
-
-def synthetic_future(window, option_map, quotes):
-    """Mean of (K + CE LTP - PE LTP) over the window strikes."""
-    values = [
-        k
-        + ltp(quotes, option_map[k]["CE"])
-        - ltp(quotes, option_map[k]["PE"])
-        for k in window
-    ]
-
-    return sum(values) / len(values)
-
-
-def otm_windows(strikes, syn_fut, straddle):
-    """Calculate breakevens and matched OTM CE/PE strike lists."""
-    atm = closest(strikes, syn_fut)
-    atm_i = strikes.index(atm)
-
-    above = strikes[atm_i + 1:]
-    below = strikes[:atm_i]
-
-    if not above or not below:
-        raise RuntimeError(
-            f"Syn ATM {atm:,.0f} has no strikes on one side. "
-            "Increase Strike Count."
-        )
-
-    upper_be = syn_fut + straddle
-    lower_be = syn_fut - straddle
-
-    upper_init = closest(above, upper_be)
-    lower_init = closest(below, lower_be)
-
-    ce_init = strikes.index(upper_init) - atm_i
-    pe_init = atm_i - strikes.index(lower_init)
-
-    n = max(ce_init, pe_init)
-
-    if atm_i + n >= len(strikes) or atm_i - n < 0:
-        raise RuntimeError(
-            f"Need {n} OTM strikes per side but the chain is too short. "
-            "Increase Strike Count."
-        )
-
-    return {
-        "atm": atm,
-        "upper_be": upper_be,
-        "lower_be": lower_be,
-        "upper_init": upper_init,
-        "lower_init": lower_init,
-        "upper": strikes[atm_i + n],
-        "lower": strikes[atm_i - n],
-        "ce_init": ce_init,
-        "pe_init": pe_init,
-        "n": n,
-        "ce_strikes": strikes[atm_i + 1:atm_i + n + 1],
-        "pe_strikes": strikes[atm_i - n:atm_i],
-    }
-
-
-def deviation_table(strikes, leg, option_map, quotes, delta_map):
-    """Calculate per-strike deviation and deviation multiplied by abs(delta)."""
+def build_table(snap):
+    index_q = snap.get(INDEX_SYMBOL, {})
+    index_chp = index_q.get("chp")
+    now = time.time()
     rows = []
-
-    for k in strikes:
-        symbol = option_map[k][leg]
-        q = quotes.get(symbol)
-        delta = delta_map.get((k, leg))
-
-        if (
-            not q
-            or not is_num(q.get("lp"))
-            or not is_num(q.get("atp"))
-            or float(q["atp"]) <= 0
-        ):
-            raise RuntimeError(f"Invalid LTP/ATP for {symbol} (Waiting for WebSocket tick...)")
-
-        if not is_num(delta):
-            raise RuntimeError(
-                f"Missing/invalid option-chain greeks.delta for {leg} strike {k:,.0f}. "
-                "Check that optionchain() was called with greeks='1'."
-            )
-
-        lp = float(q["lp"])
-        atp = float(q["atp"])
-        abs_delta = abs(float(delta))
-        dev = (lp - atp) / atp * 100
-
+    for ticker, sym in SYMBOLS.items():
+        q = snap.get(sym, {})
+        chp = q.get("chp")
+        rel = (chp - index_chp) if (chp is not None and index_chp is not None) else None
         rows.append({
-            "Strike": k,
-            f"{leg} LTP": lp,
-            f"{leg} ATP": atp,
-            f"{leg} Delta": abs_delta,
-            f"{leg} Dev %": dev,
-            f"{leg} Dev × |Delta| %": dev * abs_delta,
+            "Symbol": ticker,
+            "LTP": q.get("ltp"),
+            "Change %": chp,
+            f"{INDEX_NAME} %": index_chp,
+            "Relative %": rel,
+            "Volume": q.get("volume"),
+            "Age (s)": round(now - q["time"], 1) if q.get("time") else None,
         })
+    return index_q, pd.DataFrame(rows)
 
-    return pd.DataFrame(rows)
 
+def fmt_table(df):
+    return df.style.format({
+        "LTP": "{:,.2f}", "Change %": "{:+.2f}%", f"{INDEX_NAME} %": "{:+.2f}%",
+        "Relative %": "{:+.2f}%", "Volume": "{:,.0f}", "Age (s)": "{:.1f}",
+    }, na_rep="—")
 
-def delta_adjusted_avg(df, leg):
-    """Arithmetic mean of each strike's Dev% * absolute delta."""
-    values = df[f"{leg} Dev × |Delta| %"]
-    if values.empty:
-        raise RuntimeError(f"No {leg} strikes available to average.")
-    return float(values.mean())
-
-
-def top3_contract_deviation_table(top3_contracts, option_map, quotes, delta_map):
-    """Calculate LTP-ATP deviations only for the actual Top-3 contracts.
-
-    A CE row contributes only to the CE average; a PE row contributes only to
-    the PE average. If the same strike appears as both CE and PE in the Top 3,
-    each contract contributes to its own side's average. Contracts outside the
-    Top 3 are not included.
-    """
-    result_rows = []
-    ce_values = []
-    pe_values = []
-    ce_complete = True
-    pe_complete = True
-    expected_ce = 0
-    expected_pe = 0
-
-    for _, contract in top3_contracts.iterrows():
-        rank = int(contract["Rank"])
-        strike = float(contract["Strike"])
-        leg = str(contract["Type"]).upper()
-        symbol = option_map.get(strike, {}).get(leg)
-        if not symbol:
-            symbol = contract.get("Symbol")
-
-        quote = quotes.get(symbol, {}) if symbol else {}
-        delta = delta_map.get((strike, leg))
-        lp = quote.get("lp")
-        atp = quote.get("atp")
-
-        if leg == "CE":
-            expected_ce += 1
-        elif leg == "PE":
-            expected_pe += 1
-
-        valid = (
-            leg in ("CE", "PE")
-            and symbol is not None
-            and is_num(lp)
-            and is_num(atp)
-            and float(atp) > 0
-            and is_num(delta)
-        )
-
-        if valid:
-            lp = float(lp)
-            atp = float(atp)
-            abs_delta = abs(float(delta))
-            dev = (lp - atp) / atp * 100
-            adjusted = dev * abs_delta
-            status = "OK"
-            if leg == "CE":
-                ce_values.append(adjusted)
-            else:
-                pe_values.append(adjusted)
-        else:
-            # Work out exactly what is missing so the Status column is useful.
-            reasons = []
-            if not is_num(lp):
-                reasons.append("LTP missing")
-            if not is_num(atp):
-                reasons.append("ATP missing")
-            elif float(atp) <= 0:
-                reasons.append("ATP is 0")
-            if not is_num(delta):
-                reasons.append("delta missing")
-            if symbol is None:
-                reasons.append("symbol missing")
-
-            lp = float(lp) if is_num(lp) else None
-            atp = float(atp) if is_num(atp) else None
-            abs_delta = abs(float(delta)) if is_num(delta) else None
-            dev = None
-            adjusted = None
-            status = "Waiting: " + ", ".join(reasons) if reasons else "Waiting for data"
-            if leg == "CE":
-                ce_complete = False
-            elif leg == "PE":
-                pe_complete = False
-
-        result_rows.append({
-            "Rank": rank,
-            "Strike": strike,
-            "Type": leg,
-            "Symbol": symbol or "Unavailable",
-            "LTP": lp,
-            "ATP": atp,
-            "|Delta|": abs_delta,
-            "Dev %": dev,
-            "Dev × |Delta| %": adjusted,
-            "Status": status,
-        })
-
-    avg_ce = (
-        float(sum(ce_values) / expected_ce)
-        if expected_ce > 0 and ce_complete and len(ce_values) == expected_ce
-        else None
-    )
-    avg_pe = (
-        float(sum(pe_values) / expected_pe)
-        if expected_pe > 0 and pe_complete and len(pe_values) == expected_pe
-        else None
-    )
-
-    return pd.DataFrame(result_rows), avg_ce, avg_pe
-
-
-def compute(ws_manager, fyers, underlying, strikecount, expiry):
-    """Run existing signal calculations plus a widest-chain turnover ranking."""
-
-    # FYERS caps option-chain requests at 50 strikes on either side of ATM.
-    # Use that widest response for ranking; keep the user's strikecount for
-    # the existing LTP-ATP and OI signal calculations below.
-    chain = fetch_chain(fyers, underlying, 50, expiry)
-
-    if chain.get("s") == "error" or chain.get("code", 200) != 200:
-        raise RuntimeError(f"Option-chain request failed: {chain}")
-
-    chain_rows = chain.get("data", {}).get("optionsChain", [])
-    if not chain_rows:
-        raise RuntimeError("No option chain rows returned.")
-
-    turnover_df = build_turnover_table(chain_rows)
-
-    # Use the exact Top-3 ranked contracts, preserving each contract's CE/PE type.
-    full_option_map = build_option_map(chain_rows)
-    full_delta_map = build_delta_map(chain_rows)
-    top3_contracts = (
-        turnover_df.head(3)[["Rank", "Strike", "Type", "Symbol"]].copy()
-        if not turnover_df.empty
-        else pd.DataFrame(columns=["Rank", "Strike", "Type", "Symbol"])
-    )
-    top3_symbols = []
-    for _, contract in top3_contracts.iterrows():
-        strike = float(contract["Strike"])
-        leg = str(contract["Type"]).upper()
-        symbol = full_option_map.get(strike, {}).get(leg) or contract.get("Symbol")
-        if symbol:
-            top3_symbols.append(symbol)
-
-    # Subscribe to the underlying first; the chain response can supply
-    # an initial spot fallback before the first WebSocket tick arrives.
-    ws_manager.subscribe([underlying])
-    try:
-        spot = fetch_spot(ws_manager, underlying)
-    except RuntimeError:
-        spot = get_chain_spot(chain_rows)
-        if not is_num(spot):
-            raise RuntimeError(
-                f"Spot LTP unavailable for {underlying}; waiting for WebSocket/chain data."
-            )
-        spot = float(spot)
-
-    # Keep the existing signal and OI calculations restricted to the selected
-    # number of strikes on either side of the spot/ATM.
-    rows = select_signal_rows(chain_rows, spot, strikecount)
-    delta_map = build_delta_map(rows)
-    option_map = build_option_map(rows)
-
-    all_symbols = [underlying]
-    for legs in option_map.values():
-        if "CE" in legs:
-            all_symbols.append(legs["CE"])
-        if "PE" in legs:
-            all_symbols.append(legs["PE"])
-    # Add only the specific ranked contracts in the Top 3.
-    all_symbols.extend(top3_symbols)
-    ws_manager.subscribe(all_symbols)
-
-    strikes = sorted(
-        k for k, legs in option_map.items()
-        if "CE" in legs and "PE" in legs
-    )
-    if len(strikes) < 3:
-        raise RuntimeError(
-            "Fewer than 3 strikes with both CE and PE in the selected signal range."
-        )
-
-    step = min(b - a for a, b in zip(strikes, strikes[1:]))
-
-    spot_window = three_around(
-        strikes,
-        closest(strikes, spot),
-        step,
-    )
-
-    symbols = [
-        option_map[k][leg]
-        for k in spot_window
-        for leg in ("CE", "PE")
-    ]
-    quotes = fetch_quotes(ws_manager, symbols)
-
-    syn_fut = synthetic_future(
-        spot_window,
-        option_map,
-        quotes,
-    )
-
-    atm = closest(strikes, syn_fut)
-    atm_symbols = [
-        option_map[atm]["CE"],
-        option_map[atm]["PE"],
-    ]
-    quotes.update(
-        fetch_quotes(
-            ws_manager,
-            [symbol for symbol in atm_symbols if symbol not in quotes],
-        )
-    )
-
-    straddle = sum(ltp(quotes, symbol) for symbol in atm_symbols)
-    win = otm_windows(strikes, syn_fut, straddle)
-
-    oi_map = build_oi_map(rows)
-    oi_metrics = calculate_oi_metrics(
-        oi_map,
-        win["ce_strikes"],
-        win["pe_strikes"],
-    )
-
-    otm_symbols = (
-        [option_map[k]["CE"] for k in win["ce_strikes"]]
-        + [option_map[k]["PE"] for k in win["pe_strikes"]]
-    )
-    quotes.update(
-        fetch_quotes(
-            ws_manager,
-            [symbol for symbol in otm_symbols if symbol not in quotes],
-        )
-    )
-
-    ce_df = deviation_table(
-        win["ce_strikes"], "CE", option_map, quotes, delta_map
-    )
-    pe_df = deviation_table(
-        win["pe_strikes"], "PE", option_map, quotes, delta_map
-    )
-
-    # Refresh only the exact Top-3 ranked contracts. Each row's Type decides
-    # which average it contributes to (CE rows -> CE average, PE rows -> PE average).
-    quotes.update(fetch_quotes(ws_manager, top3_symbols))
-
-    # REST fallback for any Top-3 contract still missing a usable LTP/ATP.
-    missing = [s for s in top3_symbols if not quote_ok(quotes.get(s))]
-    if missing:
-        rest = fetch_rest_quotes(fyers, missing)
-        for s in missing:
-            r_q = rest.get(s) or {}
-            cur = quotes.setdefault(s, {})
-            for k in ("lp", "atp", "bid", "ask", "volume"):
-                if not is_num(cur.get(k)) and is_num(r_q.get(k)):
-                    cur[k] = r_q[k]
-
-    top3_deviation_df, top3_avg_ce, top3_avg_pe = top3_contract_deviation_table(
-        top3_contracts,
-        full_option_map,
-        quotes,
-        full_delta_map,
-    )
-
-    return {
-        "spot": spot,
-        "syn_fut": syn_fut,
-        "straddle": straddle,
-        "win": win,
-        "ce_df": ce_df,
-        "pe_df": pe_df,
-        "avg_ce": delta_adjusted_avg(ce_df, "CE"),
-        "avg_pe": delta_adjusted_avg(pe_df, "PE"),
-        "oi_metrics": oi_metrics,
-        "quotes": quotes,
-        "turnover_df": turnover_df,
-        "top3_contracts": top3_contracts,
-        "top3_deviation_df": top3_deviation_df,
-        "top3_avg_ce": top3_avg_ce,
-        "top3_avg_pe": top3_avg_pe,
-        "strike_range": (
-            strikes[0],
-            strikes[-1],
-            len(strikes),
-            step,
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
-# UI helpers
-# ---------------------------------------------------------------------------
-
-def ms_until_next_boundary(step_seconds, buffer_ms=300):
-    step_ms = max(int(step_seconds), 1) * 1000
-    now = datetime.now(IST)
-
-    ms_today = (
-        ((now.hour * 60 + now.minute) * 60 + now.second) * 1000
-        + now.microsecond // 1000
-    )
-
-    return max(step_ms - ms_today % step_ms + buffer_ms, 200)
-
-
-def render_calculation(df, leg, avg):
-    st.write(
-        f"**OTM {leg} Strikes: Dev % × absolute delta** "
-        f"where Dev = ({leg} LTP − {leg} ATP) / {leg} ATP × 100:"
-    )
-
-    for _, r in df.iterrows():
-        ltp_ = r[f"{leg} LTP"]
-        atp_ = r[f"{leg} ATP"]
-        delta = r[f"{leg} Delta"]
-        dev = r[f"{leg} Dev %"]
-        adjusted = r[f"{leg} Dev × |Delta| %"]
-
-        st.write(
-            f"{r['Strike']:,.0f}: "
-            f"({ltp_:,.2f} − {atp_:,.2f}) / {atp_:,.2f} "
-            f"= {dev:+,.2f}% × |delta| {delta:.4f} "
-            f"= **{adjusted:+,.2f}%**"
-        )
-
-    terms = " + ".join(
-        f"({value:+,.2f}%)"
-        for value in df[f"{leg} Dev × |Delta| %"]
-    )
-    count = len(df)
-    st.write(
-        f"**Average {leg} Dev × |Delta|:** "
-        f"({terms}) / {count} = **{avg:+,.2f}%**"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Main rendering
-# ---------------------------------------------------------------------------
-
-def render(r):
-    w = r["win"]
-    lo, hi, count, step = r["strike_range"]
-
-    st.caption(
-        f"Loaded both-leg strikes: {int(lo):,}–{int(hi):,} "
-        f"({count} strikes, step {int(step)}) [WebSocket Feed Live]"
-    )
-
-    # -----------------------------------------------------------------------
-    # ALERT & HISTORY TRACKING LOGIC
-    # -----------------------------------------------------------------------
-    if "alert_history" not in st.session_state:
-        st.session_state.alert_history = []
-
-    avg_ce = r["avg_ce"]
-    avg_pe = r["avg_pe"]
-
-    val_ce_int = int(abs(avg_ce))
-    val_pe_int = int(abs(avg_pe))
-
-    if val_ce_int == val_pe_int:
-        current_time_str = datetime.now(IST).strftime('%d-%b-%Y %I:%M:%S %p IST')
-        match_entry = {
-            "time": current_time_str,
-            "avg_ce": avg_ce,
-            "avg_pe": avg_pe,
-            "int_val": val_ce_int
-        }
-        # Prevent duplicate entries within the same second
-        if not st.session_state.alert_history or st.session_state.alert_history[-1]["time"] != current_time_str:
-            st.session_state.alert_history.append(match_entry)
-
-        st.warning(
-            f"🚨 **ALERT MATCH DETECTED!** Integer parts of absolute average deviations match: "
-            f"|Avg CE Dev| = {abs(avg_ce):,.2f} (Integer: {val_ce_int}) | "
-            f"|Avg PE Dev| = {abs(avg_pe):,.2f} (Integer: {val_pe_int})"
-        )
-
-    # Display Alert History Tracker section
-    if st.session_state.alert_history:
-        st.subheader("🚨 Deviation Match Alert History & Last Occurrence")
-        last_match = st.session_state.alert_history[-1]
-        st.info(
-            f"**Last Happened At:** {last_match['time']}  \n"
-            f"• **Avg CE Dev × |Delta|:** {last_match['avg_ce']:+.2f}% (Integer Value: {int(abs(last_match['avg_ce']))})  \n"
-            f"• **Avg PE Dev × |Delta|:** {last_match['avg_pe']:+.2f}% (Integer Value: {int(abs(last_match['avg_pe']))})"
-        )
-
-        with st.expander("View Full Match History Log"):
-            history_df = pd.DataFrame([
-                {
-                    "Timestamp": h["time"],
-                    "Avg CE Dev %": f"{h['avg_ce']:+.2f}%",
-                    "Avg PE Dev %": f"{h['avg_pe']:+.2f}%",
-                    "Matched Integer": h["int_val"]
-                }
-                for h in st.session_state.alert_history
-            ])
-            st.dataframe(history_df, width="stretch", hide_index=True)
-
-    for side, other, init, init_n, final in (
-        ("CE", "PE", w["upper_init"], w["ce_init"], w["upper"]),
-        ("PE", "CE", w["lower_init"], w["pe_init"], w["lower"]),
-    ):
-        if init != final:
-            st.info(
-                f"**OTM {side} side extended** — closest strike to "
-                f"the breakeven was {init:,.0f} ({init_n} strikes), "
-                f"extended to {final:,.0f} ({w['n']} strikes) "
-                f"to match {other}."
-            )
-
-    # Basic market metrics
-    m = st.columns(3)
-    m[0].metric("Spot", f"{r['spot']:,.2f}")
-    m[1].metric("Syn Future", f"{r['syn_fut']:,.2f}")
-    m[2].metric("Syn ATM", f"{w['atm']:,.0f}")
-
-    m = st.columns(3)
-    m[0].metric("Straddle @ Syn ATM", f"{r['straddle']:,.2f}")
-    m[1].metric("Upper BE Strike", f"{w['upper']:,.0f}")
-    m[2].metric("Lower BE Strike", f"{w['lower']:,.0f}")
-
-    # LTP - ATP metrics
-    m = st.columns(4)
-
-    m[0].metric(
-        "Avg CE Dev × |Delta| %",
-        f"{r['avg_ce']:+,.2f}%",
-    )
-
-    m[1].metric(
-        "Avg PE Dev × |Delta| %",
-        f"{r['avg_pe']:+,.2f}%",
-    )
-
-    m[2].metric(
-        "OTM Strikes / Side",
-        str(w["n"]),
-    )
-
-    ratio = (
-        abs(r["avg_ce"] / r["avg_pe"])
-        if r["avg_pe"] != 0
-        else None
-    )
-
-    m[3].metric(
-        "Abs CE Dev / PE Dev",
-        f"{ratio:,.2f}" if ratio is not None else "N/A",
-    )
-
-    st.caption(
-        f"**OTM CE** ({len(w['ce_strikes'])}): "
-        f"{[int(s) for s in w['ce_strikes']]}  ·  "
-        f"**OTM PE** ({len(w['pe_strikes'])}): "
-        f"{[int(s) for s in w['pe_strikes']]}"
-    )
-
-    # Delta-adjusted turnover-proxy ranking across the widest chain response.
-    st.subheader("Expiry Turnover Ranking — |Delta| × LTP × Volume")
-    turnover_df = r["turnover_df"]
-    st.caption(
-        "Ranked across the widest FYERS option-chain response (up to 50 strikes "
-        "above and 50 below ATM). This is a proxy: latest LTP × cumulative "
-        "volume × |delta|, not exchange-reported traded turnover."
-    )
-
-    if turnover_df.empty:
-        st.warning(
-            "FYERS did not return usable LTP, cumulative volume and delta together "
-            "for the option contracts, so no turnover ranks can be calculated yet."
-        )
-    else:
-        top3 = turnover_df.head(3)
-        top3_ce = int((top3["Type"] == "CE").sum())
-        top3_pe = int((top3["Type"] == "PE").sum())
-        leader = top3.iloc[0]
-        m = st.columns(3)
-        m[0].metric("CE contracts in Top 3", str(top3_ce))
-        m[1].metric("PE contracts in Top 3", str(top3_pe))
-        m[2].metric(
-            "Rank #1 Contract",
-            f"{leader['Type']} {leader['Strike']:,.0f}",
-        )
-
-        # Group the actual Top-3 ranked contracts by their reported Type.
-        st.caption(
-            "The averages use only the exact Top 3 ranked contracts, grouped by Type: "
-            "CE-ranked contracts contribute to the CE average, and PE-ranked "
-            "contracts contribute to the PE average. A strike contributes to "
-            "both sides only if both its CE and PE contracts are separately in the Top 3."
-        )
-        avg_cols = st.columns(2)
-        top3_avg_ce = r["top3_avg_ce"]
-        top3_avg_pe = r["top3_avg_pe"]
-        avg_cols[0].metric(
-            "Top-3 CE Contracts Avg Dev × |Delta| %",
-            f"{top3_avg_ce:+,.2f}%" if top3_avg_ce is not None
-            else ("No CE in Top 3" if top3_ce == 0 else "N/A"),
-        )
-        avg_cols[1].metric(
-            "Top-3 PE Contracts Avg Dev × |Delta| %",
-            f"{top3_avg_pe:+,.2f}%" if top3_avg_pe is not None
-            else ("No PE in Top 3" if top3_pe == 0 else "N/A"),
-        )
-
-        # Only warn when a type that IS present in the Top 3 lacks valid data.
-        waiting = (
-            (top3_ce > 0 and top3_avg_ce is None)
-            or (top3_pe > 0 and top3_avg_pe is None)
-        )
-        if waiting:
-            st.info(
-                "Waiting for valid WebSocket LTP/ATP and delta data for one "
-                "or more Top-3 contracts of that type. An average is shown "
-                "only when all Top-3 contracts of that type have valid data. "
-                "See the Status column below for the exact missing field."
-            )
-
-        if not r["top3_deviation_df"].empty:
-            st.write("**Deviation calculation for each actual Top-3 ranked contract:**")
-            top3_fmt = {
-                "Strike": "{:,.0f}",
-                "LTP": "{:,.2f}",
-                "ATP": "{:,.2f}",
-                "|Delta|": "{:.4f}",
-                "Dev %": "{:+.2f}%",
-                "Dev × |Delta| %": "{:+.2f}%",
-            }
-            st.dataframe(
-                r["top3_deviation_df"].style.format(
-                    top3_fmt,
-                    na_rep="N/A",
-                ),
-                width="stretch",
-                hide_index=True,
-            )
-
-        if top3_ce == 3:
-            st.info("Top 3 are all CE contracts.")
-        elif top3_pe == 3:
-            st.info("Top 3 are all PE contracts.")
-        elif top3_ce > top3_pe:
-            st.info(f"Top 3 lean CE: {top3_ce} CE and {top3_pe} PE contracts.")
-        elif top3_pe > top3_ce:
-            st.info(f"Top 3 lean PE: {top3_pe} PE and {top3_ce} CE contracts.")
-        else:
-            st.info("Top 3 are split evenly between CE and PE contracts.")
-
-        display_columns = [
-            "Rank", "Strike", "Type", "LTP", "Volume", "|Delta|",
-            "|Delta| × LTP × Volume",
-        ]
-        display_df = turnover_df[display_columns]
-        fmt = {
-            "Strike": "{:,.0f}",
-            "LTP": "{:,.2f}",
-            "Volume": "{:,.0f}",
-            "|Delta|": "{:.4f}",
-            "|Delta| × LTP × Volume": "{:,.2f}",
-        }
-        st.write("**Top 10 contracts, ranked highest to lowest:**")
-        st.dataframe(
-            display_df.head(10).style.format(fmt),
-            width="stretch",
-            hide_index=True,
-        )
-        with st.expander(f"View complete ranking ({len(turnover_df)} contracts)"):
-            st.dataframe(
-                display_df.style.format(fmt),
-                width="stretch",
-                hide_index=True,
-            )
-
-    # PCR and OI change metrics
-    oi = r["oi_metrics"]
-
-    st.subheader("OI Analysis — Selected OTM Strike Range")
-
-    m = st.columns(4)
-
-    m[0].metric(
-        "PCR (PE OI / CE OI)",
-        f"{oi['pcr']:.3f}" if oi["pcr"] is not None else "N/A",
-    )
-
-    m[1].metric(
-        "Total PE OI Change",
-        f"{oi['pe_oich']:+,.0f}",
-    )
-
-    m[2].metric(
-        "Total CE OI Change",
-        f"{oi['ce_oich']:+,.0f}",
-    )
-
-    m[3].metric(
-        "Net OI Change (PE − CE)",
-        f"{oi['net_oich']:+,.0f}",
-    )
-
-    st.caption(
-        f"PE OI: {oi['pe_oi']:,.0f}  ·  "
-        f"CE OI: {oi['ce_oi']:,.0f}  ·  "
-        f"PCR = {oi['pe_oi']:,.0f} / {oi['ce_oi']:,.0f}"
-    )
-
-    # Individual strike tables
-    st.subheader("OTM CE / PE Deviation × Absolute Delta")
-
-    left, right = st.columns(2)
-
-    def table_format(leg):
-        return {
-            f"{leg} LTP": "{:.2f}",
-            f"{leg} ATP": "{:.2f}",
-            f"{leg} Delta": "{:.4f}",
-            f"{leg} Dev %": "{:+.2f}%",
-            f"{leg} Dev × |Delta| %": "{:+.2f}%",
-        }
-
-    left.dataframe(
-        r["ce_df"].style.format(table_format("CE")),
-        width="stretch",
-        hide_index=True,
-    )
-
-    right.dataframe(
-        r["pe_df"].style.format(table_format("PE")),
-        width="stretch",
-        hide_index=True,
-    )
-
-    # Calculation details
-    st.subheader("Calculation")
-
-    render_calculation(
-        r["ce_df"],
-        "CE",
-        r["avg_ce"],
-    )
-
-    render_calculation(
-        r["pe_df"],
-        "PE",
-        r["avg_pe"],
-    )
-
-    # Raw quote data
-    with st.expander("Raw Quotes WebSocket Data"):
-        raw = pd.DataFrame([
-            {
-                "Symbol": symbol,
-                "LTP": quote.get("lp"),
-                "ATP": quote.get("atp"),
-                "Bid": quote.get("bid"),
-                "Ask": quote.get("ask"),
-                "Volume": quote.get("volume"),
-            }
-            for symbol, quote in r["quotes"].items()
-        ])
-
-        st.dataframe(
-            raw,
-            width="stretch",
-            hide_index=True,
-        )
-
-    # Formula reference
-    with st.expander("Strategy Formula"):
-        st.latex(
-            r"Dev_K=\frac{LTP_K-ATP_K}{ATP_K}\times100"
-        )
-
-        st.latex(
-            r"SynFut=\frac{1}{3}\sum_{K\in SpotATM\pm1}"
-            r"(K+CE_{LTP,K}-PE_{LTP,K})"
-        )
-
-        st.latex(
-            r"Straddle=CE_{LTP,SynATM}+PE_{LTP,SynATM}"
-        )
-
-        st.latex(
-            r"BE_{\pm}=SynFut\pm Straddle"
-        )
-
-        st.latex(
-            r"AdjustedDev_K=Dev_K\times|Delta_K|"
-        )
-
-        st.latex(
-            r"AvgCE=\frac{1}{N_{CE}}\sum_{K\in OTM\ CE}(Dev^{CE}_K\times|Delta^{CE}_K|)"
-        )
-
-        st.latex(
-            r"AvgPE=\frac{1}{N_{PE}}\sum_{K\in OTM\ PE}(Dev^{PE}_K\times|Delta^{PE}_K|)"
-        )
-
-        st.latex(
-            r"PCR=\frac{\sum PE\ OI}{\sum CE\ OI}"
-        )
-
-        st.latex(
-            r"NetOIChange=\sum PE\ oich-\sum CE\ oich"
-        )
-
-        st.latex(
-            r"DeltaAdjustedActivity_K=|Delta_K|\times LTP_K\times Volume_K"
-        )
-
-        st.write(
-            "The turnover ranking is a proxy because latest LTP is multiplied "
-            "by cumulative traded volume. FYERS option-chain requests return "
-            "at most 50 strikes on either side of ATM, so contracts beyond "
-            "that returned range are not included. "
-        )
-
-        st.write(
-            "OTM CE = selected strikes above Syn ATM up to the "
-            "upper breakeven. OTM PE = selected strikes below "
-            "Syn ATM down to the lower breakeven. If the counts "
-            "differ, the shorter side is extended outward, never "
-            "trimmed. OI metrics use these same selected strike "
-            "lists. Informational only — no orders are sent."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Main application
-# ---------------------------------------------------------------------------
 
 def main():
-    st.set_page_config(
-        page_title="NIFTY LTP-ATP + OI Signal (WebSocket + Alerts)",
-        layout="wide",
-    )
-
-    st.header("NIFTY LTP − ATP + OI/PCR Signal (WebSocket Stream & Alerts)")
-
-    st.markdown(
-        "<style>[data-testid='stMetricValue']"
-        "{font-size:22px!important}"
-        "[data-testid='stMetricLabel'] p"
-        "{font-size:13px!important}</style>",
-        unsafe_allow_html=True,
+    st.set_page_config(page_title=f"{INDEX_NAME} Relative Strength", page_icon="📈", layout="wide")
+    st.title(f"{INDEX_NAME} · Outperformers vs Underperformers")
+    st.caption(
+        f"Relative % = stock % change today − {INDEX_NAME} % change today. "
+        "Live via Fyers WebSocket. Display only."
     )
 
     with st.sidebar:
-        st.header("Settings")
-
-        client_id = st.text_input("Client ID")
-        access_token = st.text_input(
-            "Access Token",
-            type="password",
+        st.header("Connection")
+        client_id = st.text_input("Client ID (app id)", placeholder="XXXXXXXX-100", key="client_id")
+        token = st.text_input("Access token", type="password", key="token_in")
+        st.header("Filters")
+        min_vol = st.number_input(
+            "Min volume today", min_value=0, value=0, step=10000,
+            help="Hide thinly traded stocks from the rankings.",
         )
-
-        underlying = st.text_input(
-            "Underlying",
-            value="NSE:NIFTY50-INDEX",
-        )
-
-        strikecount = st.number_input(
-            "Strike Count",
-            min_value=1,
-            max_value=50,
-            value=15,
-            step=1,
-        )
-
-        auto = st.checkbox(
-            "Auto Refresh",
-            value=True,
-        )
-
-        every = st.number_input(
-            "Refresh Every (seconds)",
-            min_value=1,
-            max_value=3600,
-            value=5,
-            step=1,
-        )
+        st.header("Refresh")
+        auto = st.checkbox("Auto refresh", value=True)
+        every = st.number_input("Interval (seconds)", 1, 60, 3, disabled=not auto)
+        if st.button("Disconnect"):
+            mgr = st.session_state.pop("ws_manager", None)
+            if mgr:
+                mgr.stop()
+            st.session_state.pop("ws_token", None)
+            st.rerun()
 
     if auto:
-        st_autorefresh(
-            interval=ms_until_next_boundary(every),
-            key="atp_refresh",
-        )
+        st_autorefresh(interval=int(every) * 1000, key="rs_refresh")
 
-    st.caption(
-        "Last refreshed: "
-        f"{datetime.now(IST).strftime('%d-%b-%Y %I:%M:%S %p IST')}"
-    )
-
-    if not client_id or not access_token:
-        st.info("Enter Client ID and Access Token in the sidebar.")
+    if not token:
+        st.info("Enter your Fyers client ID and access token in the sidebar to start.")
         return
 
-    if "ws_manager" not in st.session_state or st.session_state.get("token") != access_token:
-        if "ws_manager" in st.session_state:
-            st.session_state.ws_manager.stop()
+    full_token = token if ":" in token else f"{client_id}:{token}"
+    if st.session_state.get("ws_token") != full_token:
+        old = st.session_state.get("ws_manager")
+        if old:
+            old.stop()
+        mgr = MarketWSManager(full_token, [INDEX_SYMBOL] + list(SYMBOLS.values()))
+        mgr.start()
+        st.session_state.ws_manager = mgr
+        st.session_state.ws_token = full_token
+    mgr = st.session_state.ws_manager
 
-        ws_mgr = MarketWSManager(access_token)
-        ws_mgr.start()
-        st.session_state.ws_manager = ws_mgr
-        st.session_state.token = access_token
+    index_q, df = build_table(mgr.snapshot())
+    live = df.dropna(subset=["Relative %"])
+    if min_vol:
+        live = live[live["Volume"].fillna(0) >= min_vol]
 
-    ws_manager = st.session_state.ws_manager
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("WebSocket", "Connected" if mgr.connected else "Connecting…")
+    c2.metric(INDEX_NAME, f"{index_q['ltp']:,.2f}" if index_q.get("ltp") else "—",
+              f"{index_q['chp']:+.2f}%" if index_q.get("chp") is not None else None)
+    c3.metric("Stocks ranked", f"{len(live)} / {len(TICKERS)}")
+    stale = df[df["Age (s)"].fillna(0) > STALE_AFTER_S]
+    c4.metric(f"Quiet (>{STALE_AFTER_S}s)", len(stale),
+              help="Illiquid names in a 500-stock universe can legitimately go quiet.")
 
-    try:
-        fyers = fyersModel.FyersModel(
-            client_id=client_id,
-            token=access_token,
-            is_async=False,
-            log_path="",
-        )
+    if mgr.last_error:
+        st.warning(f"Socket message: {mgr.last_error}")
 
-        expiry_response = fetch_chain(
-            fyers,
-            underlying,
-            strikecount,
-        )
-
-        expiries = (
-            expiry_response.get("data", {}).get("expiryData", [])
-        )
-
-        if not expiries:
-            raise RuntimeError(
-                f"No expiry data returned by Fyers: {expiry_response}"
-            )
-
-        with st.sidebar:
-            st.divider()
-
-            i = st.selectbox(
-                "Expiry",
-                range(len(expiries)),
-                format_func=lambda idx: expiry_label(expiries[idx]),
-            )
-
-        result = compute(
-            ws_manager,
-            fyers,
-            underlying,
-            strikecount,
-            expiry_value(expiries[i]),
-        )
-
-    except Exception as e:
-        st.error(str(e))
+    if index_q.get("chp") is None:
+        st.info(f"Waiting for the {INDEX_NAME} index tick…")
+        return
+    if live.empty:
+        st.info("Waiting for stock ticks…")
         return
 
-    render(result)
+    ranked = live.sort_values("Relative %", ascending=False).reset_index(drop=True)
+    top = ranked.head(TOP_N).copy()
+    bottom = ranked.tail(TOP_N).sort_values("Relative %").copy()
 
-    if st.button("Manual Refresh"):
-        st.rerun()
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.subheader(f"🟢 Top {TOP_N} outperformers")
+        st.dataframe(fmt_table(top), hide_index=True, width="stretch")
+    with right:
+        st.subheader(f"🔴 Top {TOP_N} underperformers")
+        st.dataframe(fmt_table(bottom), hide_index=True, width="stretch")
+
+    st.subheader("Extremes · top 15 and bottom 15 by relative %")
+    extremes = pd.concat([ranked.head(15), ranked.tail(15)]).drop_duplicates("Symbol")
+    st.bar_chart(extremes.set_index("Symbol")["Relative %"], height=320)
+
+    with st.expander("Full ranked table", expanded=False):
+        search = st.text_input("Filter symbol", key="sym_filter").strip().upper()
+        view = ranked[ranked["Symbol"].str.contains(search, regex=False)] if search else ranked
+        st.dataframe(fmt_table(view), hide_index=True, width="stretch", height=520)
+        st.download_button(
+            "Export CSV", ranked.to_csv(index=False).encode(),
+            file_name=f"nifty500_relative_{datetime.now(IST):%Y%m%d_%H%M%S}.csv", mime="text/csv",
+        )
+
+    missing = df[df["Relative %"].isna()]["Symbol"].tolist()
+    if missing:
+        with st.expander(f"No tick yet · {len(missing)} symbols"):
+            st.write(", ".join(missing))
+            st.caption("Persistent entries may use a non-EQ series or a different FYERS symbol; "
+                       "adjust SERIES_OVERRIDE in the code.")
+    st.caption(f"Updated {datetime.now(IST):%d %b %Y %I:%M:%S %p IST}")
 
 
 if __name__ == "__main__":
