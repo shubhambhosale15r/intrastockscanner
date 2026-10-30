@@ -10,7 +10,7 @@ Run:  streamlit run t.py
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, time as dtime
 from io import BytesIO
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
@@ -27,6 +27,18 @@ TOP_N = 5  # default value for the "Top N to show" input
 STALE_AFTER_S = 15
 SYMBOL_MASTER_URL = "https://public.fyers.in/sym_details/NSE_CM.csv"
 SYMBOL_MASTER_CACHE_SECONDS = 24 * 60 * 60
+
+# ---- Paper trading ----------------------------------------------------------
+MARKET_OPEN = dtime(9, 15)
+
+# Intraday equity charges (per executed order, NSE).
+BROKERAGE_PCT = 0.0003        # 0.03% ...
+BROKERAGE_CAP = 20.0          # ... or Rs. 20 per executed order, whichever is lower
+STT_SELL_PCT = 0.00025        # 0.025% on the sell side
+TXN_PCT = 0.0000307           # NSE transaction charges 0.00307%
+SEBI_PER_CRORE = 10.0         # Rs. 10 / crore
+GST_PCT = 0.18                # 18% on (brokerage + SEBI + transaction charges)
+STAMP_BUY_PCT = 0.00003       # 0.003% on the buy side
 
 _TICKER_TEXT = """
 360ONE ABB ACC ACMESOLAR AIAENG APLAPOLLO AUBANK AWL AADHARHFC AARTIIND AAVAS
@@ -352,6 +364,333 @@ def fmt_table(df):
     }, na_rep="—")
 
 
+def new_paper_state():
+    return {
+        "positions": {},      # ticker -> open position dict
+        "trades": [],         # closed trades
+        "last_key": None,     # (date, clock slot) of the last rebalance
+        "was_on": False,
+        "rounds": 0,
+        "last_rebalance": None,
+        "last_per_stock": None,
+        "last_round": None,
+        "history": [],
+    }
+
+
+def calc_charges(side, turnover):
+    """Charges for ONE executed intraday-equity order (side is 'BUY' or 'SELL')."""
+    if turnover <= 0:
+        return 0.0
+    brokerage = min(turnover * BROKERAGE_PCT, BROKERAGE_CAP)
+    txn = turnover * TXN_PCT
+    sebi = turnover * SEBI_PER_CRORE / 1e7
+    gst = GST_PCT * (brokerage + sebi + txn)
+    stt = turnover * STT_SELL_PCT if side == "SELL" else 0.0
+    stamp = turnover * STAMP_BUY_PCT if side == "BUY" else 0.0
+    return brokerage + txn + sebi + gst + stt + stamp
+
+
+def clock_slot(now, interval):
+    """Clock-aligned slot number: 15-min interval -> 11:00, 11:15, 11:30 ..."""
+    return (now.hour * 60 + now.minute) // int(interval)
+
+
+def next_rebalance_label(now, interval, square_off):
+    interval = int(interval)
+    cur = now.hour * 60 + now.minute
+    open_min = MARKET_OPEN.hour * 60 + MARKET_OPEN.minute
+    base = max(cur + 1, open_min)
+    nxt_min = -(-base // interval) * interval  # ceil to the next multiple
+    if nxt_min >= square_off.hour * 60 + square_off.minute:
+        return f"Square-off {square_off:%H:%M}"
+    return f"{nxt_min // 60:02d}:{nxt_min % 60:02d}"
+
+
+def paper_close_one(state, cfg, now, ltp_map, sym, reason):
+    pos = state["positions"].get(sym)
+    if pos is None:
+        return
+    exit_px = float(ltp_map.get(sym, pos["last_px"]))
+    qty = pos["qty"]
+    if pos["side"] == "LONG":
+        gross = (exit_px - pos["entry"]) * qty
+        exit_side = "SELL"
+    else:
+        gross = (pos["entry"] - exit_px) * qty
+        exit_side = "BUY"
+    exit_charges = calc_charges(exit_side, exit_px * qty) if cfg["charges_on"] else 0.0
+    charges = pos["entry_charges"] + exit_charges
+    state["trades"].append({
+        "Symbol": sym,
+        "Side": pos["side"],
+        "Qty": qty,
+        "Entry": pos["entry"],
+        "Exit": exit_px,
+        "Entry time": pos["entry_time"],
+        "Exit time": now,
+        "Gross P&L": gross,
+        "Charges": charges,
+        "Net P&L": gross - charges,
+        "Reason": reason,
+    })
+    del state["positions"][sym]
+
+
+def paper_close_all(state, cfg, now, ltp_map, reason):
+    for sym in list(state["positions"]):
+        paper_close_one(state, cfg, now, ltp_map, sym, reason)
+
+
+def paper_open(state, cfg, now, sym, side, ltp, per_stock):
+    if ltp is None or ltp <= 0:
+        return
+    qty = int(per_stock / ltp)
+    if qty < 1:
+        return
+    entry_side = "BUY" if side == "LONG" else "SELL"
+    charges = calc_charges(entry_side, ltp * qty) if cfg["charges_on"] else 0.0
+    state["positions"][sym] = {
+        "side": side,
+        "qty": qty,
+        "entry": float(ltp),
+        "entry_time": now,
+        "entry_charges": charges,
+        "last_px": float(ltp),
+    }
+
+
+def paper_step(state, cfg, now, top, bottom, ltp_map, force=False):
+    """Advance the paper-trading engine by one refresh."""
+    for sym, pos in state["positions"].items():
+        if sym in ltp_map:
+            pos["last_px"] = float(ltp_map[sym])
+
+    if not cfg["on"]:
+        if state["positions"]:
+            paper_close_all(state, cfg, now, ltp_map, "paper mode off")
+        state["was_on"] = False
+        return
+
+    key = (now.date(), clock_slot(now, cfg["interval"]))
+    if not state["was_on"]:
+        # First rebalance happens at the NEXT round boundary, not mid-slot.
+        state["was_on"] = True
+        state["last_key"] = key
+
+    t = now.time()
+    if t >= cfg["square_off"]:
+        if state["positions"]:
+            paper_close_all(state, cfg, now, ltp_map, "square-off")
+        return
+    if t < MARKET_OPEN:
+        return
+    if state["last_key"] == key and not force:
+        return
+
+    state["last_key"] = key
+
+    # Target book for this round: symbol -> (side, ltp).
+    target = {r["Symbol"]: ("LONG", r["LTP"]) for _, r in top.iterrows()}
+    target.update({r["Symbol"]: ("SHORT", r["LTP"]) for _, r in bottom.iterrows()})
+    state["rounds"] += 1
+    state["last_rebalance"] = now
+
+    # Exit only positions that dropped out of the lists (or flipped side).
+    # A stock that is still in the same list is held untouched: no exit, no re-entry.
+    exited = 0
+    for sym, pos in list(state["positions"].items()):
+        want = target.get(sym)
+        if want is None or want[0] != pos["side"]:
+            paper_close_one(state, cfg, now, ltp_map, sym, "rebalance")
+            exited += 1
+    held = len(state["positions"])
+
+    if not target or cfg["capital"] <= 0:
+        state["last_per_stock"] = None
+        state["last_round"] = {"held": held, "exited": exited, "entered": 0}
+        return
+
+    # New entries get an equal share of capital across ALL target stocks.
+    per_stock = cfg["capital"] / len(target)
+    state["last_per_stock"] = per_stock
+    entered = 0
+    for sym, (side, ltp) in target.items():
+        if sym in state["positions"]:
+            continue
+        paper_open(state, cfg, now, sym, side, ltp, per_stock)
+        if sym in state["positions"]:
+            entered += 1
+    state["last_round"] = {"held": held, "exited": exited, "entered": entered}
+
+
+def render_paper_section(state, cfg, now, ltp_map):
+    st.subheader("📝 Paper trading")
+    if not cfg["on"] and not state["trades"] and not state["positions"]:
+        st.info("Paper trade mode is off. Turn it on in the sidebar to start.")
+        return
+
+    trades_df = pd.DataFrame(state["trades"])
+    per_sym = {}  # symbol -> running totals for the live per-stock table
+    if not trades_df.empty:
+        for sym, g in trades_df.groupby("Symbol"):
+            per_sym[sym] = {
+                "Status": "Closed", "Trades": len(g),
+                "Realized": float(g["Gross P&L"].sum()), "Unrealized": 0.0,
+                "Charges": float(g["Charges"].sum()),
+            }
+
+    pos_rows = []
+    unreal = invested = open_entry_charges = est_exit_charges = 0.0
+    for sym, p in state["positions"].items():
+        ltp = ltp_map.get(sym, p["last_px"])
+        pnl = (ltp - p["entry"]) * p["qty"] if p["side"] == "LONG" else (p["entry"] - ltp) * p["qty"]
+        exit_side = "SELL" if p["side"] == "LONG" else "BUY"
+        est_exit = calc_charges(exit_side, ltp * p["qty"]) if cfg["charges_on"] else 0.0
+        unreal += pnl
+        invested += p["entry"] * p["qty"]
+        open_entry_charges += p["entry_charges"]
+        est_exit_charges += est_exit
+        row = per_sym.setdefault(sym, {"Status": "", "Trades": 0, "Realized": 0.0,
+                                       "Unrealized": 0.0, "Charges": 0.0})
+        row["Status"] = f"Open {p['side']}"
+        row["Unrealized"] += pnl
+        row["Charges"] += p["entry_charges"] + est_exit
+        pos_rows.append({
+            "Symbol": sym, "Side": p["side"], "Qty": p["qty"], "Entry": p["entry"],
+            "LTP": ltp, "Invested": p["entry"] * p["qty"], "Unrealized P&L": pnl,
+            "Entry time": p["entry_time"].strftime("%H:%M:%S"),
+        })
+
+    realized_gross = float(trades_df["Gross P&L"].sum()) if not trades_df.empty else 0.0
+    closed_charges = float(trades_df["Charges"].sum()) if not trades_df.empty else 0.0
+    # Open positions count their entry charges plus the estimated exit charges, so the
+    # live net P&L converges to the final number once everything is squared off.
+    total_charges = closed_charges + open_entry_charges + est_exit_charges
+    net_total = realized_gross + unreal - total_charges
+    gross_total = realized_gross + unreal
+
+    # Net P&L history for the live curve (one point per refresh, capped).
+    hist = state.setdefault("history", [])
+    if not hist or (now - hist[-1][0]).total_seconds() >= 1:
+        hist.append((now, net_total, gross_total))
+        if len(hist) > 5000:
+            del hist[: len(hist) - 5000]
+
+    ret_pct = (net_total / cfg["capital"] * 100) if cfg["capital"] > 0 else None
+
+    # ---- Live P&L --------------------------------------------------------------
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Next rebalance",
+              next_rebalance_label(now, cfg["interval"], cfg["square_off"]) if cfg["on"] else "Off")
+    c2.metric("Open positions", len(state["positions"]),
+              help=f"Rebalances done: {state['rounds']}")
+    c3.metric("Realized (gross)", f"₹{realized_gross:,.2f}")
+    c4.metric("Unrealized", f"₹{unreal:,.2f}")
+    c5.metric("Charges", f"₹{total_charges:,.2f}" if cfg["charges_on"] else "Off",
+              help="Includes estimated exit charges on open positions.")
+    c6.metric("Net P&L", f"₹{net_total:,.2f}",
+              f"{ret_pct:+.2f}% of capital" if ret_pct is not None else None)
+
+    if state["last_rebalance"] is not None:
+        per = state["last_per_stock"]
+        lr = state.get("last_round") or {}
+        st.caption(
+            f"Last rebalance {state['last_rebalance']:%H:%M:%S} · "
+            + (f"₹{per:,.2f} per new stock · invested ₹{invested:,.2f}"
+               if per else "no qualifying stocks, stayed flat")
+            + (f" · held {lr.get('held', 0)}, exited {lr.get('exited', 0)}, "
+               f"entered {lr.get('entered', 0)}" if lr else "")
+        )
+
+    st.markdown("**Open positions**")
+    if pos_rows:
+        st.dataframe(
+            pd.DataFrame(pos_rows).style.format({
+                "Entry": "{:,.2f}", "LTP": "{:,.2f}", "Invested": "{:,.2f}",
+                "Unrealized P&L": "{:+,.2f}",
+            }, na_rep="—"),
+            hide_index=True, width="stretch",
+        )
+    else:
+        st.caption("No open positions.")
+
+    # ---- Day summary (live until square-off, final afterwards) ----------------
+    is_final = (not state["positions"]) and (not trades_df.empty) \
+        and now.time() >= cfg["square_off"]
+    st.markdown(f"**Day summary · {'FINAL' if is_final else 'LIVE'}**")
+
+    sym_rows = []
+    for sym, v in per_sym.items():
+        sym_rows.append({
+            "Symbol": sym, "Status": v["Status"], "Closed trades": v["Trades"],
+            "Realized": v["Realized"], "Unrealized": v["Unrealized"],
+            "Charges": v["Charges"],
+            "Net P&L": v["Realized"] + v["Unrealized"] - v["Charges"],
+        })
+    sym_df = pd.DataFrame(sym_rows)
+
+    s1, s2, s3, s4 = st.columns(4)
+    n_closed = len(trades_df)
+    win_rate = float((trades_df["Net P&L"] > 0).mean() * 100) if n_closed else None
+    s1.metric("Closed trades", n_closed,
+              f"win rate {win_rate:.0f}%" if win_rate is not None else None, delta_color="off")
+    if not sym_df.empty:
+        best = sym_df.loc[sym_df["Net P&L"].idxmax()]
+        worst = sym_df.loc[sym_df["Net P&L"].idxmin()]
+        s2.metric("Best stock", best["Symbol"], f"₹{best['Net P&L']:+,.2f}")
+        s3.metric("Worst stock", worst["Symbol"], f"₹{worst['Net P&L']:+,.2f}")
+    else:
+        s2.metric("Best stock", "—")
+        s3.metric("Worst stock", "—")
+    s4.metric("Net P&L" + (" (final)" if is_final else " (live)"), f"₹{net_total:,.2f}")
+
+    if not sym_df.empty:
+        sym_df = sym_df.sort_values("Net P&L", ascending=False).reset_index(drop=True)
+        total_row = pd.DataFrame([{
+            "Symbol": "TOTAL", "Status": "", "Closed trades": int(sym_df["Closed trades"].sum()),
+            "Realized": realized_gross, "Unrealized": unreal,
+            "Charges": total_charges, "Net P&L": net_total,
+        }])
+        sym_view = pd.concat([sym_df, total_row], ignore_index=True)
+        st.dataframe(
+            sym_view.style.format({
+                "Realized": "{:+,.2f}", "Unrealized": "{:+,.2f}",
+                "Charges": "{:,.2f}", "Net P&L": "{:+,.2f}",
+            }, na_rep="—"),
+            hide_index=True, width="stretch",
+        )
+        st.download_button(
+            "Export day summary CSV",
+            sym_view.to_csv(index=False).encode("utf-8"),
+            file_name=f"paper_summary_{now:%Y%m%d_%H%M%S}.csv",
+            mime="text/csv",
+        )
+
+    if len(hist) >= 2:
+        curve = pd.DataFrame(hist, columns=["Time", "Net P&L", "Gross P&L"]).set_index("Time")
+        st.line_chart(curve, height=220)
+
+    if not trades_df.empty:
+        with st.expander(f"Closed trades · {len(trades_df)}", expanded=False):
+            view = trades_df.iloc[::-1].copy()
+            view["Entry time"] = view["Entry time"].dt.strftime("%H:%M:%S")
+            view["Exit time"] = view["Exit time"].dt.strftime("%H:%M:%S")
+            st.dataframe(
+                view.style.format({
+                    "Entry": "{:,.2f}", "Exit": "{:,.2f}", "Gross P&L": "{:+,.2f}",
+                    "Charges": "{:,.2f}", "Net P&L": "{:+,.2f}",
+                }, na_rep="—"),
+                hide_index=True, width="stretch", height=360,
+            )
+            st.download_button(
+                "Export trades CSV",
+                view.to_csv(index=False).encode("utf-8"),
+                file_name=f"paper_trades_{now:%Y%m%d_%H%M%S}.csv",
+                mime="text/csv",
+            )
+
+
 def main():
     st.set_page_config(
         page_title=f"{INDEX_NAME} Relative Strength",
@@ -381,6 +720,31 @@ def main():
             help="Hide thinly traded stocks from the rankings.",
         )
 
+        st.header("Paper trading")
+        paper_on = st.checkbox(
+            "Paper trade mode", value=False,
+            help="Long the top outperformers and short the top underperformers, "
+                 "rebalancing on every round interval.",
+        )
+        paper_capital = st.number_input(
+            "Capital (₹)", min_value=0.0, value=100000.0, step=1000.0,
+            help="Split equally across all selected stocks at each rebalance.",
+        )
+        rebalance_min = st.number_input(
+            "Rebalance every (minutes)", min_value=1, max_value=240, value=15, step=1,
+            help="Clock-aligned: 15 → 11:00, 11:15, 11:30, 11:45 …",
+        )
+        square_off_t = st.time_input(
+            "Square-off time", value=dtime(15, 5),
+            help="All positions are closed at this time and no new ones are opened.",
+        )
+        charges_on = st.checkbox(
+            "Include charges (intraday equity)", value=False,
+            help="Brokerage, STT, transaction, SEBI, GST and stamp charges on every order.",
+        )
+        rebalance_now = st.button("Rebalance now")
+        reset_paper = st.button("Reset paper account")
+
         st.header("Refresh")
         auto = st.checkbox("Auto refresh", value=True)
         every = st.number_input("Interval (seconds)", 1, 60, 3, disabled=not auto)
@@ -392,6 +756,9 @@ def main():
             st.session_state.pop("ws_token", None)
             st.session_state.pop("ws_symbols", None)
             st.rerun()
+
+    if reset_paper or "paper" not in st.session_state:
+        st.session_state["paper"] = new_paper_state()
 
     if auto:
         st_autorefresh(interval=int(every) * 1000, key="rs_refresh")
@@ -533,6 +900,20 @@ def main():
     top = above_atp.sort_values("Relative %", ascending=False).head(n).copy()
     bottom = below_atp.sort_values("Relative %", ascending=True).head(n).copy()
 
+    # Paper trading engine: runs once per refresh on the current top/bottom lists.
+    now_ist = datetime.now(IST)
+    paper = st.session_state["paper"]
+    paper_cfg = {
+        "on": paper_on,
+        "capital": float(paper_capital),
+        "interval": int(rebalance_min),
+        "square_off": square_off_t,
+        "charges_on": charges_on,
+    }
+    ltp_map = df.set_index("Symbol")["LTP"].dropna().to_dict()
+    paper_step(paper, paper_cfg, now_ist, top, bottom, ltp_map,
+               force=bool(rebalance_now and paper_on))
+
     left, right = st.columns(2, gap="large")
     with left:
         st.subheader(f"🟢 Top {n} outperformers (LTP > ATP)")
@@ -550,6 +931,8 @@ def main():
     st.subheader(f"Extremes · top {n} and bottom {n} by relative % (ATP-filtered)")
     extremes = pd.concat([top, bottom]).drop_duplicates("Symbol")
     st.bar_chart(extremes.set_index("Symbol")["Relative %"], height=320)
+
+    render_paper_section(paper, paper_cfg, now_ist, ltp_map)
 
     with st.expander("Full ranked table", expanded=False):
         search = st.text_input("Filter symbol", key="sym_filter").strip().upper()
