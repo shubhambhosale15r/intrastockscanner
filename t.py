@@ -335,7 +335,13 @@ def build_table(snap, symbols):
             "Volume": q.get("volume"),
             "Age (s)": round(now - q["time"], 1) if q.get("time") else None,
         })
-    return index_q, pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # Columns that are still empty (e.g. no ATP tick yet) would otherwise be object
+    # dtype full of None, which breaks numeric comparisons. Force them to float/NaN.
+    for col in ["Open", "LTP", "ATP", "From open %", f"{INDEX_NAME} %",
+                "Relative %", "Volume", "Age (s)"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return index_q, df
 
 
 def fmt_table(df):
@@ -519,9 +525,11 @@ def main():
 
     # Outperformers must trade above their average traded price (ATP);
     # underperformers must trade below it. Stocks without an ATP are excluded.
-    has_atp = ranked["ATP"].notna()
-    above_atp = ranked[has_atp & (ranked["LTP"] > ranked["ATP"])]
-    below_atp = ranked[has_atp & (ranked["LTP"] < ranked["ATP"])]
+    ltp_s = pd.to_numeric(ranked["LTP"], errors="coerce")
+    atp_s = pd.to_numeric(ranked["ATP"], errors="coerce")
+    valid = ltp_s.notna() & atp_s.notna()
+    above_atp = ranked[valid & (ltp_s > atp_s)]
+    below_atp = ranked[valid & (ltp_s < atp_s)]
     top = above_atp.sort_values("Relative %", ascending=False).head(n).copy()
     bottom = below_atp.sort_values("Relative %", ascending=True).head(n).copy()
 
