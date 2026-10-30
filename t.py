@@ -241,6 +241,10 @@ class MarketWSManager:
                 q["open"] = opn
             if q.get("ltp") is not None and q.get("open") is not None and q["open"] > 0:
                 q["chp_open"] = (q["ltp"] - q["open"]) / q["open"] * 100
+            # Average traded price (VWAP-like) for the day, sent by Fyers as avg_trade_price.
+            atp = _num(message.get("avg_trade_price"))
+            if atp is not None and atp > 0:
+                q["atp"] = atp
             vol = _num(message.get("vol_traded_today"))
             if vol is not None:
                 q["volume"] = int(vol)
@@ -324,6 +328,7 @@ def build_table(snap, symbols):
             "FYERS Symbol": sym,
             "Open": q.get("open"),
             "LTP": q.get("ltp"),
+            "ATP": q.get("atp"),
             "From open %": chp,
             f"{INDEX_NAME} %": index_chp,
             "Relative %": rel,
@@ -335,7 +340,7 @@ def build_table(snap, symbols):
 
 def fmt_table(df):
     return df.style.format({
-        "Open": "{:,.2f}", "LTP": "{:,.2f}", "From open %": "{:+.2f}%",
+        "Open": "{:,.2f}", "LTP": "{:,.2f}", "ATP": "{:,.2f}", "From open %": "{:+.2f}%",
         f"{INDEX_NAME} %": "{:+.2f}%",
         "Relative %": "{:+.2f}%", "Volume": "{:,.0f}", "Age (s)": "{:.1f}",
     }, na_rep="—")
@@ -510,20 +515,32 @@ def main():
         return
 
     ranked = live.sort_values("Relative %", ascending=False).reset_index(drop=True)
-    n = int(min(top_n, len(ranked)))  # never ask for more rows than are ranked
-    top = ranked.head(n).copy()
-    bottom = ranked.tail(n).sort_values("Relative %", ascending=True).copy()
+    n = int(top_n)
+
+    # Outperformers must trade above their average traded price (ATP);
+    # underperformers must trade below it. Stocks without an ATP are excluded.
+    has_atp = ranked["ATP"].notna()
+    above_atp = ranked[has_atp & (ranked["LTP"] > ranked["ATP"])]
+    below_atp = ranked[has_atp & (ranked["LTP"] < ranked["ATP"])]
+    top = above_atp.sort_values("Relative %", ascending=False).head(n).copy()
+    bottom = below_atp.sort_values("Relative %", ascending=True).head(n).copy()
 
     left, right = st.columns(2, gap="large")
     with left:
-        st.subheader(f"🟢 Top {n} outperformers")
-        st.dataframe(fmt_table(top), hide_index=True, width="stretch")
+        st.subheader(f"🟢 Top {n} outperformers (LTP > ATP)")
+        if top.empty:
+            st.info("No stocks currently qualify (need LTP above average traded price).")
+        else:
+            st.dataframe(fmt_table(top), hide_index=True, width="stretch")
     with right:
-        st.subheader(f"🔴 Top {n} underperformers")
-        st.dataframe(fmt_table(bottom), hide_index=True, width="stretch")
+        st.subheader(f"🔴 Top {n} underperformers (LTP < ATP)")
+        if bottom.empty:
+            st.info("No stocks currently qualify (need LTP below average traded price).")
+        else:
+            st.dataframe(fmt_table(bottom), hide_index=True, width="stretch")
 
-    st.subheader(f"Extremes · top {n} and bottom {n} by relative %")
-    extremes = pd.concat([ranked.head(n), ranked.tail(n)]).drop_duplicates("Symbol")
+    st.subheader(f"Extremes · top {n} and bottom {n} by relative % (ATP-filtered)")
+    extremes = pd.concat([top, bottom]).drop_duplicates("Symbol")
     st.bar_chart(extremes.set_index("Symbol")["Relative %"], height=320)
 
     with st.expander("Full ranked table", expanded=False):
