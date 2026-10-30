@@ -2,7 +2,8 @@
 
 Subscribes to the NIFTY 500 index and its constituents over the Fyers data
 socket, then ranks stocks by (stock % change - NIFTY 500 % change) so you can
-see the top 3 outperformers and top 3 underperformers live. Display only.
+see the top N outperformers and top N underperformers live. Display only.
+N is configurable from the sidebar (default 5).
 
 Run:  streamlit run t.py
 """
@@ -22,7 +23,7 @@ from streamlit_autorefresh import st_autorefresh
 IST = ZoneInfo("Asia/Kolkata")
 INDEX_SYMBOL = "NSE:NIFTY500-INDEX"
 INDEX_NAME = "NIFTY 500"
-TOP_N = 3
+TOP_N = 5  # default value for the "Top N to show" input
 STALE_AFTER_S = 15
 SYMBOL_MASTER_URL = "https://public.fyers.in/sym_details/NSE_CM.csv"
 SYMBOL_MASTER_CACHE_SECONDS = 24 * 60 * 60
@@ -360,6 +361,10 @@ def main():
         token = st.text_input("Access token", type="password", key="token_in")
 
         st.header("Filters")
+        top_n = st.number_input(
+            "Top N to show", min_value=1, max_value=100, value=TOP_N, step=1,
+            help="How many top outperformers and underperformers to display.",
+        )
         min_vol = st.number_input(
             "Min volume today", min_value=0, value=0, step=10000,
             help="Hide thinly traded stocks from the rankings.",
@@ -505,19 +510,20 @@ def main():
         return
 
     ranked = live.sort_values("Relative %", ascending=False).reset_index(drop=True)
-    top = ranked.head(TOP_N).copy()
-    bottom = ranked.tail(TOP_N).sort_values("Relative %", ascending=True).copy()
+    n = int(min(top_n, len(ranked)))  # never ask for more rows than are ranked
+    top = ranked.head(n).copy()
+    bottom = ranked.tail(n).sort_values("Relative %", ascending=True).copy()
 
     left, right = st.columns(2, gap="large")
     with left:
-        st.subheader(f"🟢 Top {TOP_N} outperformers")
+        st.subheader(f"🟢 Top {n} outperformers")
         st.dataframe(fmt_table(top), hide_index=True, width="stretch")
     with right:
-        st.subheader(f"🔴 Top {TOP_N} underperformers")
+        st.subheader(f"🔴 Top {n} underperformers")
         st.dataframe(fmt_table(bottom), hide_index=True, width="stretch")
 
-    st.subheader("Extremes · top 15 and bottom 15 by relative %")
-    extremes = pd.concat([ranked.head(15), ranked.tail(15)]).drop_duplicates("Symbol")
+    st.subheader(f"Extremes · top {n} and bottom {n} by relative %")
+    extremes = pd.concat([ranked.head(n), ranked.tail(n)]).drop_duplicates("Symbol")
     st.bar_chart(extremes.set_index("Symbol")["Relative %"], height=320)
 
     with st.expander("Full ranked table", expanded=False):
