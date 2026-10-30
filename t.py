@@ -8,10 +8,14 @@ N is configurable from the sidebar (default 5).
 Run:  streamlit run t.py
 """
 
+import json
+import tempfile
 import threading
 import time
+import zipfile
 from datetime import datetime, time as dtime
 from io import BytesIO
+from pathlib import Path
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -39,6 +43,11 @@ TXN_PCT = 0.0000307           # NSE transaction charges 0.00307%
 SEBI_PER_CRORE = 10.0         # Rs. 10 / crore
 GST_PCT = 0.18                # 18% on (brokerage + SEBI + transaction charges)
 STAMP_BUY_PCT = 0.00003       # 0.003% on the buy side
+
+MARKET_CLOSE = dtime(15, 30)
+APP_VERSION = "2026-10-30-recorder-v1"
+DISPLAY_COLS = ["Symbol", "FYERS Symbol", "Open", "LTP", "ATP", "From open %",
+                f"{INDEX_NAME} %", "Relative %", "Volume", "Age (s)"]
 
 _TICKER_TEXT = """
 360ONE ABB ACC ACMESOLAR AIAENG APLAPOLLO AUBANK AWL AADHARHFC AARTIIND AAVAS
@@ -260,6 +269,14 @@ class MarketWSManager:
             vol = _num(message.get("vol_traded_today"))
             if vol is not None:
                 q["volume"] = int(vol)
+            # Extra fields kept for post-market analysis (spread, range, order imbalance).
+            for key, field in (("high", "high_price"), ("low", "low_price"),
+                               ("prev_close", "prev_close_price"), ("bid", "bid_price"),
+                               ("ask", "ask_price"), ("buy_qty", "tot_buy_qty"),
+                               ("sell_qty", "tot_sell_qty")):
+                val = _num(message.get(field))
+                if val is not None:
+                    q[key] = val
             q["time"] = time.time()
 
     def on_error(self, msg):
@@ -346,22 +363,189 @@ def build_table(snap, symbols):
             "Relative %": rel,
             "Volume": q.get("volume"),
             "Age (s)": round(now - q["time"], 1) if q.get("time") else None,
+            "High": q.get("high"), "Low": q.get("low"), "Prev close": q.get("prev_close"),
+            "Bid": q.get("bid"), "Ask": q.get("ask"),
+            "Buy qty": q.get("buy_qty"), "Sell qty": q.get("sell_qty"),
         })
     df = pd.DataFrame(rows)
     # Columns that are still empty (e.g. no ATP tick yet) would otherwise be object
     # dtype full of None, which breaks numeric comparisons. Force them to float/NaN.
     for col in ["Open", "LTP", "ATP", "From open %", f"{INDEX_NAME} %",
-                "Relative %", "Volume", "Age (s)"]:
+                "Relative %", "Volume", "Age (s)", "High", "Low", "Prev close",
+                "Bid", "Ask", "Buy qty", "Sell qty"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return index_q, df
 
 
 def fmt_table(df):
+    df = df[[c for c in DISPLAY_COLS if c in df.columns]]
     return df.style.format({
         "Open": "{:,.2f}", "LTP": "{:,.2f}", "ATP": "{:,.2f}", "From open %": "{:+.2f}%",
         f"{INDEX_NAME} %": "{:+.2f}%",
         "Relative %": "{:+.2f}%", "Volume": "{:,.0f}", "Age (s)": "{:.1f}",
     }, na_rep="—")
+
+
+README_TEXT = """STRATEGY DATA EXPORT
+====================
+One folder = one trading day. All times are IST (ISO 8601, +05:30).
+
+market_snapshots.csv   Every N seconds (default 60) for EVERY stock with a live quote:
+                       Time, Symbol, LTP, Open, High, Low, Prev close, ATP, Bid, Ask,
+                       Volume, Buy qty, Sell qty, From open %, Index %, Relative %,
+                       Age (s), Rank (1 = strongest relative %), Candidate
+                       (LONG / SHORT = in the tradable top/bottom lists at that moment).
+index_series.csv       NIFTY 500 index: LTP, Open, High, Low, Prev close, From open %.
+rebalance_events.csv   One row per stock per rebalance: HOLD / EXIT / ENTER / SKIP,
+                       with the reason, price, relative %, and quantity.
+trades.csv             Every closed paper trade: entry/exit, gross/net P&L, charges,
+                       hold minutes, MFE % (best move in your favour), MAE % (worst move
+                       against you), entry relative %, entry/exit spread %, reason.
+equity_curve.csv       Realized / unrealized / charges / net P&L and open long/short counts.
+config_changes.csv     Every settings combination used during the day, with the time.
+run_config.json        Settings at export time and app version.
+"""
+
+
+def _pick_data_root():
+    """Folder for recorded data: next to the script, else the system temp dir."""
+    try:
+        bases = [Path(__file__).resolve().parent, Path(tempfile.gettempdir())]
+    except NameError:
+        bases = [Path.cwd(), Path(tempfile.gettempdir())]
+    for base in bases:
+        try:
+            root = base / "paper_data"
+            root.mkdir(parents=True, exist_ok=True)
+            probe = root / ".write_test"
+            probe.write_text("ok")
+            probe.unlink()
+            return root
+        except Exception:
+            continue
+    return None
+
+
+class DataRecorder:
+    """Append-only CSV recorder, one folder per trading day under paper_data/.
+
+    Lives for the whole server process (st.cache_resource), so it survives page
+    refreshes. Files stay on disk, so a rerun never loses the day's data.
+    """
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.root = _pick_data_root()
+        self.last_sample = None
+        self.last_cfg = None
+        self.last_error = None
+
+    def _path(self, now, name):
+        folder = self.root / f"{now:%Y-%m-%d}"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / f"{name}.csv"
+
+    def due(self, now, every_s):
+        """True at most once per `every_s` seconds, only during market hours."""
+        if self.root is None:
+            return False
+        t = now.time()
+        if t < MARKET_OPEN or t > MARKET_CLOSE:
+            return False
+        with self.lock:
+            if self.last_sample is None or \
+                    (now - self.last_sample).total_seconds() >= every_s - 0.5:
+                self.last_sample = now
+                return True
+        return False
+
+    def append(self, now, name, frame):
+        if self.root is None or frame is None or len(frame) == 0:
+            return
+        try:
+            with self.lock:
+                path = self._path(now, name)
+                frame.to_csv(path, mode="a", header=not path.exists(), index=False)
+        except Exception as exc:  # never let logging break the scanner
+            self.last_error = f"{name}: {exc}"
+
+    def log_config(self, now, settings):
+        with self.lock:
+            if settings == self.last_cfg:
+                return
+            self.last_cfg = dict(settings)
+        row = {"Time": now.isoformat(timespec="seconds"), **settings}
+        self.append(now, "config_changes", pd.DataFrame([row]))
+
+    def log_snapshot(self, now, df, index_q, top, bottom):
+        live = df[df["LTP"].notna() & df["Open"].notna()]
+        if live.empty:
+            return
+        ts = now.isoformat(timespec="seconds")
+        cand = {s: "LONG" for s in top["Symbol"]}
+        cand.update({s: "SHORT" for s in bottom["Symbol"]})
+        out = pd.DataFrame({"Time": ts, "Symbol": live["Symbol"].to_numpy()})
+        for src, dst in [("LTP", "LTP"), ("Open", "Open"), ("High", "High"), ("Low", "Low"),
+                         ("Prev close", "Prev close"), ("ATP", "ATP"), ("Bid", "Bid"),
+                         ("Ask", "Ask"), ("Volume", "Volume"), ("Buy qty", "Buy qty"),
+                         ("Sell qty", "Sell qty"), ("From open %", "From open %"),
+                         (f"{INDEX_NAME} %", "Index %"), ("Relative %", "Relative %"),
+                         ("Age (s)", "Age (s)")]:
+            out[dst] = live[src].to_numpy()
+        out["Rank"] = live["Relative %"].rank(ascending=False, method="first").to_numpy()
+        out["Candidate"] = live["Symbol"].map(cand).fillna("").to_numpy()
+        self.append(now, "market_snapshots", out.round(4))
+
+        idx = {"Time": ts, "LTP": index_q.get("ltp"), "Open": index_q.get("open"),
+               "High": index_q.get("high"), "Low": index_q.get("low"),
+               "Prev close": index_q.get("prev_close"),
+               "From open %": index_q.get("chp_open")}
+        self.append(now, "index_series", pd.DataFrame([idx]).round(4))
+
+    def log_events(self, now, events):
+        if events:
+            self.append(now, "rebalance_events", pd.DataFrame(events).round(4))
+
+    def log_trade(self, now, row):
+        self.append(now, "trades", pd.DataFrame([row]).round(4))
+
+    def log_equity(self, now, metrics):
+        row = {"Time": now.isoformat(timespec="seconds"),
+               **{k: (round(v, 2) if isinstance(v, float) else v) for k, v in metrics.items()}}
+        self.append(now, "equity_curve", pd.DataFrame([row]))
+
+    def list_days(self):
+        if self.root is None:
+            return []
+        try:
+            return sorted((p.name for p in self.root.iterdir() if p.is_dir()), reverse=True)
+        except Exception:
+            return []
+
+    def status(self, day):
+        folder = self.root / str(day)
+        parts = []
+        for p in sorted(folder.glob("*.csv")):
+            parts.append(f"{p.stem}: {p.stat().st_size / 1e6:.1f} MB")
+        return " · ".join(parts) if parts else "empty"
+
+    def build_zip(self, day, settings):
+        folder = self.root / str(day)
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            for p in sorted(folder.glob("*.csv")):
+                z.write(p, arcname=f"{day}/{p.name}")
+            z.writestr(f"{day}/run_config.json", json.dumps(
+                {"app_version": APP_VERSION, "day": str(day),
+                 "exported_at": datetime.now(IST).isoformat(timespec="seconds"),
+                 "settings": settings}, indent=2, default=str))
+            z.writestr(f"{day}/README.txt", README_TEXT)
+        return buf.getvalue()
+
+
+@st.cache_resource(show_spinner=False)
+def get_recorder():
+    return DataRecorder()
 
 
 def new_paper_state():
@@ -407,33 +591,84 @@ def next_rebalance_label(now, interval, square_off):
     return f"{nxt_min // 60:02d}:{nxt_min % 60:02d}"
 
 
+def spread_pct(q):
+    """Quoted spread as % of LTP, or None when bid/ask are not usable."""
+    try:
+        bid, ask, ltp = q.get("Bid"), q.get("Ask"), q.get("LTP")
+        if pd.notna(bid) and pd.notna(ask) and pd.notna(ltp) and bid > 0 and ask > 0 and ltp > 0:
+            return (ask - bid) / ltp * 100
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _event(now, rnd, sym, action, side, ltp, quotes, qty=None, per_stock=None, note=""):
+    q = quotes.get(sym, {})
+    return {
+        "Time": now.isoformat(timespec="seconds"), "Round": rnd, "Symbol": sym,
+        "Action": action, "Side": side, "LTP": ltp,
+        "Relative %": q.get("Relative %"), "From open %": q.get("From open %"),
+        "Qty": qty, "Per stock": per_stock, "Note": note,
+    }
+
+
 def paper_close_one(state, cfg, now, ltp_map, sym, reason):
     pos = state["positions"].get(sym)
     if pos is None:
         return
     exit_px = float(ltp_map.get(sym, pos["last_px"]))
     qty = pos["qty"]
+    entry = pos["entry"]
     if pos["side"] == "LONG":
-        gross = (exit_px - pos["entry"]) * qty
+        gross = (exit_px - entry) * qty
         exit_side = "SELL"
     else:
-        gross = (pos["entry"] - exit_px) * qty
+        gross = (entry - exit_px) * qty
         exit_side = "BUY"
     exit_charges = calc_charges(exit_side, exit_px * qty) if cfg["charges_on"] else 0.0
     charges = pos["entry_charges"] + exit_charges
+    net = gross - charges
     state["trades"].append({
         "Symbol": sym,
         "Side": pos["side"],
         "Qty": qty,
-        "Entry": pos["entry"],
+        "Entry": entry,
         "Exit": exit_px,
         "Entry time": pos["entry_time"],
         "Exit time": now,
         "Gross P&L": gross,
         "Charges": charges,
-        "Net P&L": gross - charges,
+        "Net P&L": net,
         "Reason": reason,
     })
+
+    rec = cfg.get("recorder") if cfg.get("record") else None
+    if rec is not None:
+        hi = max(pos.get("max_px", entry), exit_px)
+        lo = min(pos.get("min_px", entry), exit_px)
+        if pos["side"] == "LONG":
+            mfe, mae = (hi - entry) / entry * 100, (lo - entry) / entry * 100
+        else:
+            mfe, mae = (entry - lo) / entry * 100, (entry - hi) / entry * 100
+        ctx = pos.get("ctx") or {}
+        q = state.get("quotes", {}).get(sym, {})
+        notional = entry * qty
+        rec.log_trade(now, {
+            "Symbol": sym, "Side": pos["side"], "Qty": qty,
+            "Entry time": pos["entry_time"].isoformat(timespec="seconds"),
+            "Exit time": now.isoformat(timespec="seconds"),
+            "Entry": entry, "Exit": exit_px, "Notional": notional,
+            "Gross P&L": gross, "Charges": charges, "Net P&L": net,
+            "Gross %": gross / notional * 100 if notional else None,
+            "Net %": net / notional * 100 if notional else None,
+            "Hold min": (now - pos["entry_time"]).total_seconds() / 60,
+            "MFE %": mfe, "MAE %": mae, "Reason": reason,
+            "Round at entry": ctx.get("round"),
+            "Entry Relative %": ctx.get("rel"), "Entry From open %": ctx.get("from_open"),
+            "Entry ATP": ctx.get("atp"), "Entry Volume": ctx.get("volume"),
+            "Entry spread %": ctx.get("spread"),
+            "Exit Relative %": q.get("Relative %"), "Exit spread %": spread_pct(q),
+        })
     del state["positions"][sym]
 
 
@@ -442,7 +677,7 @@ def paper_close_all(state, cfg, now, ltp_map, reason):
         paper_close_one(state, cfg, now, ltp_map, sym, reason)
 
 
-def paper_open(state, cfg, now, sym, side, ltp, per_stock):
+def paper_open(state, cfg, now, sym, side, ltp, per_stock, ctx=None):
     if ltp is None or ltp <= 0:
         return
     qty = int(per_stock / ltp)
@@ -457,14 +692,21 @@ def paper_open(state, cfg, now, sym, side, ltp, per_stock):
         "entry_time": now,
         "entry_charges": charges,
         "last_px": float(ltp),
+        "max_px": float(ltp),   # for MFE/MAE tracking
+        "min_px": float(ltp),
+        "ctx": ctx or {},
     }
 
 
-def paper_step(state, cfg, now, top, bottom, ltp_map, force=False):
+def paper_step(state, cfg, now, top, bottom, ltp_map, force=False, quotes=None):
     """Advance the paper-trading engine by one refresh."""
+    state["quotes"] = quotes or {}
     for sym, pos in state["positions"].items():
         if sym in ltp_map:
-            pos["last_px"] = float(ltp_map[sym])
+            px = float(ltp_map[sym])
+            pos["last_px"] = px
+            pos["max_px"] = max(pos.get("max_px", px), px)
+            pos["min_px"] = min(pos.get("min_px", px), px)
 
     if not cfg["on"]:
         if state["positions"]:
@@ -494,21 +736,33 @@ def paper_step(state, cfg, now, top, bottom, ltp_map, force=False):
     target = {r["Symbol"]: ("LONG", r["LTP"]) for _, r in top.iterrows()}
     target.update({r["Symbol"]: ("SHORT", r["LTP"]) for _, r in bottom.iterrows()})
     state["rounds"] += 1
+    rnd = state["rounds"]
     state["last_rebalance"] = now
+    rec = cfg.get("recorder") if cfg.get("record") else None
+    events = []
+    qts = state["quotes"]
 
     # Exit only positions that dropped out of the lists (or flipped side).
     # A stock that is still in the same list is held untouched: no exit, no re-entry.
     exited = 0
     for sym, pos in list(state["positions"].items()):
         want = target.get(sym)
+        px = ltp_map.get(sym, pos["last_px"])
         if want is None or want[0] != pos["side"]:
+            note = "dropped out of list" if want is None else "switched list"
+            events.append(_event(now, rnd, sym, "EXIT", pos["side"], px, qts,
+                                 qty=pos["qty"], note=note))
             paper_close_one(state, cfg, now, ltp_map, sym, "rebalance")
             exited += 1
+        else:
+            events.append(_event(now, rnd, sym, "HOLD", pos["side"], px, qts, qty=pos["qty"]))
     held = len(state["positions"])
 
     if not target or cfg["capital"] <= 0:
         state["last_per_stock"] = None
         state["last_round"] = {"held": held, "exited": exited, "entered": 0}
+        if rec is not None:
+            rec.log_events(now, events)
         return
 
     # New entries get an equal share of capital across ALL target stocks.
@@ -518,10 +772,20 @@ def paper_step(state, cfg, now, top, bottom, ltp_map, force=False):
     for sym, (side, ltp) in target.items():
         if sym in state["positions"]:
             continue
-        paper_open(state, cfg, now, sym, side, ltp, per_stock)
+        q = qts.get(sym, {})
+        ctx = {"round": rnd, "rel": q.get("Relative %"), "from_open": q.get("From open %"),
+               "atp": q.get("ATP"), "volume": q.get("Volume"), "spread": spread_pct(q)}
+        paper_open(state, cfg, now, sym, side, ltp, per_stock, ctx)
         if sym in state["positions"]:
             entered += 1
+            events.append(_event(now, rnd, sym, "ENTER", side, ltp, qts,
+                                 qty=state["positions"][sym]["qty"], per_stock=per_stock))
+        else:
+            events.append(_event(now, rnd, sym, "SKIP", side, ltp, qts, per_stock=per_stock,
+                                 note="quantity < 1 (price above per-stock capital)"))
     state["last_round"] = {"held": held, "exited": exited, "entered": entered}
+    if rec is not None:
+        rec.log_events(now, events)
 
 
 def render_paper_section(state, cfg, now, ltp_map):
@@ -694,6 +958,13 @@ def render_paper_section(state, cfg, now, ltp_map):
                 mime="text/csv",
             )
 
+    return {
+        "net_pnl": net_total, "gross_pnl": gross_total, "realized_gross": realized_gross,
+        "unrealized": unreal, "charges": total_charges, "invested": invested,
+        "open_positions": len(state["positions"]), "open_longs": n_long,
+        "open_shorts": n_short, "closed_trades": n_closed, "rebalances": state["rounds"],
+    }
+
 
 def main():
     st.set_page_config(
@@ -706,6 +977,8 @@ def main():
         f"Relative % = stock % move since today's open − {INDEX_NAME} % move since today's open. "
         "Exact stock symbols are resolved from FYERS NSE_CM.csv. Live via WebSocket. Display only."
     )
+
+    recorder = get_recorder()
 
     with st.sidebar:
         st.header("Connection")
@@ -748,6 +1021,46 @@ def main():
         )
         rebalance_now = st.button("Rebalance now")
         reset_paper = st.button("Reset paper account")
+
+        st.header("Data for analysis")
+        record_on = st.checkbox(
+            "Record data for analysis", value=True,
+            help="Saves market snapshots, trades, rebalance events and P&L to disk during "
+                 "market hours. Keep this app tab open while the market is running.",
+        )
+        sample_s = st.number_input(
+            "Snapshot every (seconds)", min_value=15, max_value=600, value=60, step=15,
+            help="How often the whole stock universe is saved. 60s is about 190k rows per "
+                 "day (a few MB zipped). Lower values give finer data and bigger files.",
+        )
+        settings = {
+            "app_version": APP_VERSION, "top_n": int(top_n), "min_volume": int(min_vol),
+            "paper_on": bool(paper_on), "capital": float(paper_capital),
+            "rebalance_min": int(rebalance_min), "square_off": square_off_t.strftime("%H:%M"),
+            "charges_on": bool(charges_on), "snapshot_s": int(sample_s),
+        }
+        if recorder.root is None:
+            st.warning("No writable folder found, so nothing can be recorded.")
+        else:
+            days = recorder.list_days()
+            if days:
+                export_day = st.selectbox("Day to export", days)
+                st.caption(recorder.status(export_day))
+                if st.button("Prepare export (ZIP)"):
+                    st.session_state["export_zip"] = (
+                        export_day, recorder.build_zip(export_day, settings))
+                zipped = st.session_state.get("export_zip")
+                if zipped:
+                    st.download_button(
+                        f"⬇️ Download {zipped[0]} data (ZIP)", zipped[1],
+                        file_name=f"strategy_data_{zipped[0]}.zip", mime="application/zip",
+                    )
+                    st.caption("Tip: untick Auto refresh while downloading.")
+            else:
+                st.caption("Nothing recorded yet. Recording starts when live ticks arrive "
+                           "during market hours.")
+            if recorder.last_error:
+                st.warning(f"Recorder: {recorder.last_error}")
 
         st.header("Refresh")
         auto = st.checkbox("Auto refresh", value=True)
@@ -913,10 +1226,21 @@ def main():
         "interval": int(rebalance_min),
         "square_off": square_off_t,
         "charges_on": charges_on,
+        "recorder": recorder,
+        "record": bool(record_on),
     }
     ltp_map = df.set_index("Symbol")["LTP"].dropna().to_dict()
+    quotes = df.set_index("Symbol").to_dict("index")
     paper_step(paper, paper_cfg, now_ist, top, bottom, ltp_map,
-               force=bool(rebalance_now and paper_on))
+               force=bool(rebalance_now and paper_on), quotes=quotes)
+
+    # Save a snapshot of the whole universe, but only while ticks are actually fresh
+    # (so a holiday or a stalled feed doesn't fill the files with stale prices).
+    fresh = int((df["Age (s)"] < max(60, 3 * int(sample_s))).sum())
+    do_sample = bool(record_on) and fresh >= 10 and recorder.due(now_ist, int(sample_s))
+    if do_sample:
+        recorder.log_config(now_ist, settings)
+        recorder.log_snapshot(now_ist, df, index_q, top, bottom)
 
     left, right = st.columns(2, gap="large")
     with left:
@@ -936,7 +1260,9 @@ def main():
     extremes = pd.concat([top, bottom]).drop_duplicates("Symbol")
     st.bar_chart(extremes.set_index("Symbol")["Relative %"], height=320)
 
-    render_paper_section(paper, paper_cfg, now_ist, ltp_map)
+    metrics = render_paper_section(paper, paper_cfg, now_ist, ltp_map)
+    if do_sample and metrics:
+        recorder.log_equity(now_ist, metrics)
 
     with st.expander("Full ranked table", expanded=False):
         search = st.text_input("Filter symbol", key="sym_filter").strip().upper()
