@@ -630,20 +630,24 @@ def render_paper_section(state, cfg, now, ltp_map):
         })
     sym_df = pd.DataFrame(sym_rows)
 
-    s1, s2, s3, s4 = st.columns(4)
+    s1, s2, s3, s4, s5, s6 = st.columns(6)
     n_closed = len(trades_df)
+    n_long = sum(1 for p in state["positions"].values() if p["side"] == "LONG")
+    n_short = sum(1 for p in state["positions"].values() if p["side"] == "SHORT")
     win_rate = float((trades_df["Net P&L"] > 0).mean() * 100) if n_closed else None
     s1.metric("Closed trades", n_closed,
               f"win rate {win_rate:.0f}%" if win_rate is not None else None, delta_color="off")
+    s2.metric("Open longs", n_long)
+    s3.metric("Open shorts", n_short)
     if not sym_df.empty:
         best = sym_df.loc[sym_df["Net P&L"].idxmax()]
         worst = sym_df.loc[sym_df["Net P&L"].idxmin()]
-        s2.metric("Best stock", best["Symbol"], f"₹{best['Net P&L']:+,.2f}")
-        s3.metric("Worst stock", worst["Symbol"], f"₹{worst['Net P&L']:+,.2f}")
+        s4.metric("Best stock", best["Symbol"], f"₹{best['Net P&L']:+,.2f}")
+        s5.metric("Worst stock", worst["Symbol"], f"₹{worst['Net P&L']:+,.2f}")
     else:
-        s2.metric("Best stock", "—")
-        s3.metric("Worst stock", "—")
-    s4.metric("Net P&L" + (" (final)" if is_final else " (live)"), f"₹{net_total:,.2f}")
+        s4.metric("Best stock", "—")
+        s5.metric("Worst stock", "—")
+    s6.metric("Net P&L" + (" (final)" if is_final else " (live)"), f"₹{net_total:,.2f}")
 
     if not sym_df.empty:
         sym_df = sym_df.sort_values("Net P&L", ascending=False).reset_index(drop=True)
