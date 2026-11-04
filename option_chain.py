@@ -139,11 +139,11 @@ def make_strike_table(chain: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, List[s
     return pd.DataFrame(rows), warnings
 
 
-def payout_curves(df: pd.DataFrame, oi_multiplier: float) -> pd.DataFrame:
-    """Gross intrinsic payout at every returned strike, using all returned CE/PE OI."""
+def payout_curves(df: pd.DataFrame) -> pd.DataFrame:
+    """Gross intrinsic payout using FYERS OI quantities (already lot-size adjusted)."""
     k = df["Strike"].to_numpy(dtype=float)
-    ce_oi = df["CE OI"].to_numpy(dtype=float) * oi_multiplier
-    pe_oi = df["PE OI"].to_numpy(dtype=float) * oi_multiplier
+    ce_oi = df["CE OI"].to_numpy(dtype=float)
+    pe_oi = df["PE OI"].to_numpy(dtype=float)
     rows = []
     for settlement in k:
         ce = float(np.sum(ce_oi * np.maximum(settlement - k, 0)))
@@ -163,6 +163,28 @@ def max_pain_level(curves: pd.DataFrame, spot: float):
     selected = min(tied, key=lambda x: abs(x - spot)) if spot > 0 else tied[0]
     row = curves.loc[curves["Settlement"] == selected].iloc[0]
     return selected, tied, minimum, row
+
+
+def strike_payout_contributions(df: pd.DataFrame, settlement: float) -> pd.DataFrame:
+    """Per-strike contribution to gross CE/PE intrinsic payout at a chosen settlement."""
+    result = df[["Strike", "CE OI", "PE OI"]].copy()
+    result["CE Payout at Max Pain"] = (
+        result["CE OI"] * np.maximum(settlement - result["Strike"], 0)
+    )
+    result["PE Payout at Max Pain"] = (
+        result["PE OI"] * np.maximum(result["Strike"] - settlement, 0)
+    )
+    return result
+
+
+def largest_payout_contributors(contributions: pd.DataFrame, payout_column: str):
+    """Return all tied strikes with the largest single-strike contribution."""
+    maximum = float(contributions[payout_column].max()) if not contributions.empty else 0.0
+    if maximum <= 0:
+        return [], maximum
+    mask = np.isclose(contributions[payout_column], maximum, rtol=1e-10, atol=1e-6)
+    strikes = contributions.loc[mask, "Strike"].astype(float).tolist()
+    return strikes, maximum
 
 
 def secret_value(key: str) -> str:
@@ -190,12 +212,6 @@ with st.sidebar:
     symbol = st.text_input("Underlying symbol", value=DEFAULT_SYMBOL).strip().upper()
     strike_count = st.slider("Strikes on each side of ATM", 1, 50, 50,
                              help="50 requests up to 50 ITM + ATM + 50 OTM strikes.")
-    oi_multiplier = st.number_input(
-        "OI quantity multiplier", min_value=0.000001, max_value=1000000.0,
-        value=1.0, step=1.0,
-        help=("Keep 1 if the API OI is already quantity-based. If your returned OI is in lots, "
-              "enter the relevant lot size. This changes payout amounts, not the Max Pain strike.")
-    )
     st.divider()
     auto_refresh = st.checkbox("Auto-refresh", value=False)
     refresh_seconds = st.select_slider("Refresh interval", options=[15, 30, 45, 60, 90, 120, 180, 300],
@@ -262,9 +278,16 @@ if spot <= 0:
     spot = float(strike_df["Strike"].iloc[(strike_df["Strike"] - strike_df["Strike"].median()).abs().argmin()])
     st.warning("Underlying LTP missing; the spot reference is approximated from the returned strikes.")
 
-curves = payout_curves(strike_df, oi_multiplier)
+curves = payout_curves(strike_df)
 max_pain, ties, min_payout, mp_row = max_pain_level(curves, spot)
 ce_at_mp, pe_at_mp = float(mp_row["CE Payout"]), float(mp_row["PE Payout"])
+strike_contributions = strike_payout_contributions(strike_df, max_pain)
+ce_top_strikes, ce_top_payout = largest_payout_contributors(
+    strike_contributions, "CE Payout at Max Pain"
+)
+pe_top_strikes, pe_top_payout = largest_payout_contributors(
+    strike_contributions, "PE Payout at Max Pain"
+)
 lo, hi = float(strike_df["Strike"].min()), float(strike_df["Strike"].max())
 
 st.caption(
@@ -297,8 +320,33 @@ c = st.columns(3)
 c[0].metric("CE-side payout", f"₹{ce_at_mp:,.0f}")
 c[1].metric("PE-side payout", f"₹{pe_at_mp:,.0f}")
 c[2].metric("Combined payout", f"₹{min_payout:,.0f}")
-st.caption("Payout = OI × OI quantity multiplier × intrinsic value. Amounts are ₹ estimates only "
-           "when the API OI unit convention and multiplier are correct.")
+st.caption("Payout = FYERS OI quantity × intrinsic value. No additional lot-size multiplier is applied.")
+
+st.subheader("Strikes contributing the highest payout at Max Pain")
+st.caption(
+    f"Each strike's contribution is calculated at the selected Max Pain settlement price: "
+    f"{max_pain:,.0f}. These are the largest individual strike contributions to the aggregate "
+    "CE-side and PE-side intrinsic payouts, not separate CE/PE Max Pain levels."
+)
+cp = st.columns(2)
+if ce_top_strikes:
+    ce_label = ", ".join(f"{x:,.0f}" for x in ce_top_strikes)
+    cp[0].metric("Highest CE payout contribution", f"₹{ce_top_payout:,.0f}",
+                 delta=f"Strike: {ce_label}", delta_color="off")
+else:
+    cp[0].metric("Highest CE payout contribution", "₹0", delta="No ITM CE contribution", delta_color="off")
+if pe_top_strikes:
+    pe_label = ", ".join(f"{x:,.0f}" for x in pe_top_strikes)
+    cp[1].metric("Highest PE payout contribution", f"₹{pe_top_payout:,.0f}",
+                 delta=f"Strike: {pe_label}", delta_color="off")
+else:
+    cp[1].metric("Highest PE payout contribution", "₹0", delta="No ITM PE contribution", delta_color="off")
+
+with st.expander("Strike-by-strike payout contributions at Max Pain"):
+    contributions_view = strike_contributions.copy()
+    for col in ["CE OI", "PE OI", "CE Payout at Max Pain", "PE Payout at Max Pain"]:
+        contributions_view[col] = contributions_view[col].round(0).astype("int64")
+    st.dataframe(contributions_view, use_container_width=True, hide_index=True)
 
 st.subheader("Expiry settlement payout curve")
 st.write("For each possible settlement price, the chart shows aggregate intrinsic payout to "
