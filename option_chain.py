@@ -24,9 +24,10 @@ from fyers_apiv3 import fyersModel
 # ------------------------------ Configuration ------------------------------
 st.set_page_config(page_title="FYERS Max Pain Dashboard", page_icon="📊", layout="wide")
 DEFAULT_SYMBOL = "NSE:NIFTY50-INDEX"
+
 try:
     IST = ZoneInfo("Asia/Kolkata") if ZoneInfo else timezone(timedelta(hours=5, minutes=30))
-except Exception:  # Windows may need the tzdata package for ZoneInfo
+except Exception:
     IST = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -40,23 +41,34 @@ def fyers_client(client_id: str, token: str):
 def read_response(response: Any, label: str) -> Dict[str, Any]:
     if not isinstance(response, dict):
         raise RuntimeError(f"{label}: unexpected FYERS response: {response!r}")
+
     status = str(response.get("s", "")).lower()
+
     if status == "error":
         raise RuntimeError(f"{label}: {response.get('message') or response}")
+
     data = response.get("data")
+
     if not isinstance(data, dict):
         raise RuntimeError(f"{label}: response does not contain a data object: {response}")
+
     return data
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_expiries(client_id: str, token: str, symbol: str) -> List[Dict[str, str]]:
-    """Expiry metadata is cached for five minutes to avoid an extra API call on every rerun."""
+    """Expiry metadata is cached for five minutes."""
     response = fyers_client(client_id, token).optionchain(data={
-        "symbol": symbol, "strikecount": 1, "timestamp": "", "greeks": "1"
+        "symbol": symbol,
+        "strikecount": 1,
+        "timestamp": "",
+        "greeks": "1"
     })
+
     data = read_response(response, "Expiry lookup")
+
     result = []
+
     for item in data.get("expiryData", []):
         if isinstance(item, dict) and item.get("expiry") is not None and item.get("date"):
             result.append({
@@ -64,19 +76,28 @@ def get_expiries(client_id: str, token: str, symbol: str) -> List[Dict[str, str]
                 "expiry": str(item["expiry"]),
                 "flag": str(item.get("expiry_flag", "")),
             })
+
     if not result:
         raise RuntimeError("No expiryData entries were returned for this symbol.")
+
     return result
 
 
-def get_chain(client_id: str, token: str, symbol: str,
-              strike_count: int, expiry_timestamp: str) -> Dict[str, Any]:
+def get_chain(
+    client_id: str,
+    token: str,
+    symbol: str,
+    strike_count: int,
+    expiry_timestamp: str
+) -> Dict[str, Any]:
+
     response = fyers_client(client_id, token).optionchain(data={
         "symbol": symbol,
         "strikecount": int(strike_count),
         "timestamp": str(expiry_timestamp),
         "greeks": "1",
     })
+
     return read_response(response, "Option-chain request")
 
 
@@ -93,281 +114,691 @@ def get_underlying(chain: List[Dict[str, Any]]) -> Dict[str, Any]:
     for item in chain:
         if not isinstance(item, dict):
             continue
+
         if not item.get("option_type") or num(item.get("strike_price"), -999) == -1:
             return item
+
     return {}
 
 
 def make_strike_table(chain: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, List[str]]:
+
     contracts: Dict[Tuple[float, str], Dict[str, Any]] = {}
+
     for item in chain:
         if not isinstance(item, dict):
             continue
+
         side = str(item.get("option_type", "")).upper()
         strike = num(item.get("strike_price"), -1)
+
         if side in ("CE", "PE") and strike >= 0:
             contracts[(strike, side)] = item
 
     strikes = sorted({strike for strike, _ in contracts})
+
     if not strikes:
         raise RuntimeError("No CE/PE contracts found in optionsChain.")
 
-    rows, missing = [], 0
+    rows = []
+    missing = 0
+
     for strike in strikes:
-        ce, pe = contracts.get((strike, "CE"), {}), contracts.get((strike, "PE"), {})
+
+        ce = contracts.get((strike, "CE"), {})
+        pe = contracts.get((strike, "PE"), {})
+
         missing += int(not bool(ce)) + int(not bool(pe))
+
         cg = ce.get("greeks") if isinstance(ce.get("greeks"), dict) else {}
         pg = pe.get("greeks") if isinstance(pe.get("greeks"), dict) else {}
+
         rows.append({
             "Strike": strike,
-            "CE LTP": num(ce.get("ltp")), "CE OI": num(ce.get("oi")),
-            "CE OI Chg": num(ce.get("oich")), "CE OI Chg %": num(ce.get("oichp")),
-            "CE Volume": num(ce.get("volume")), "CE Delta": num(cg.get("delta")),
-            "CE Gamma": num(cg.get("gamma")), "CE IV": num(cg.get("iv")),
-            "PE IV": num(pg.get("iv")), "PE Gamma": num(pg.get("gamma")),
-            "PE Delta": num(pg.get("delta")), "PE Volume": num(pe.get("volume")),
-            "PE OI Chg %": num(pe.get("oichp")), "PE OI Chg": num(pe.get("oich")),
-            "PE OI": num(pe.get("oi")), "PE LTP": num(pe.get("ltp")),
+
+            "CE LTP": num(ce.get("ltp")),
+            "CE OI": num(ce.get("oi")),
+            "CE OI Chg": num(ce.get("oich")),
+            "CE OI Chg %": num(ce.get("oichp")),
+            "CE Volume": num(ce.get("volume")),
+            "CE Delta": num(cg.get("delta")),
+            "CE Gamma": num(cg.get("gamma")),
+            "CE IV": num(cg.get("iv")),
+
+            "PE IV": num(pg.get("iv")),
+            "PE Gamma": num(pg.get("gamma")),
+            "PE Delta": num(pg.get("delta")),
+            "PE Volume": num(pe.get("volume")),
+            "PE OI Chg %": num(pe.get("oichp")),
+            "PE OI Chg": num(pe.get("oich")),
+            "PE OI": num(pe.get("oi")),
+            "PE LTP": num(pe.get("ltp")),
         })
 
     warnings = []
+
     if missing:
         warnings.append(
             f"{missing} CE/PE leg(s) were missing. Missing legs are treated as zero OI; "
             "this can distort the payout calculation."
         )
+
     return pd.DataFrame(rows), warnings
 
 
 def payout_curves(df: pd.DataFrame) -> pd.DataFrame:
-    """Gross intrinsic payout using FYERS OI quantities (already lot-size adjusted)."""
+    """Gross intrinsic payout using FYERS OI quantities."""
+
     k = df["Strike"].to_numpy(dtype=float)
     ce_oi = df["CE OI"].to_numpy(dtype=float)
     pe_oi = df["PE OI"].to_numpy(dtype=float)
+
     rows = []
+
     for settlement in k:
+
         ce = float(np.sum(ce_oi * np.maximum(settlement - k, 0)))
         pe = float(np.sum(pe_oi * np.maximum(k - settlement, 0)))
-        rows.append({"Settlement": settlement, "CE Payout": ce,
-                     "PE Payout": pe, "Total Payout": ce + pe})
+
+        rows.append({
+            "Settlement": settlement,
+            "CE Payout": ce,
+            "PE Payout": pe,
+            "Total Payout": ce + pe
+        })
+
     return pd.DataFrame(rows)
 
 
 def max_pain_level(curves: pd.DataFrame, spot: float):
+
     minimum = float(curves["Total Payout"].min())
+
     tied = curves.loc[
         np.isclose(curves["Total Payout"], minimum, rtol=1e-10, atol=1e-6),
         "Settlement"
     ].astype(float).tolist()
-    # In a tie, headline the tied strike closest to spot and disclose the full tie set.
+
+    # In a tie, select the strike closest to spot.
     selected = min(tied, key=lambda x: abs(x - spot)) if spot > 0 else tied[0]
+
     row = curves.loc[curves["Settlement"] == selected].iloc[0]
+
     return selected, tied, minimum, row
 
 
 def strike_payout_contributions(df: pd.DataFrame, settlement: float) -> pd.DataFrame:
-    """Per-strike contribution to gross CE/PE intrinsic payout at a chosen settlement."""
+    """Per-strike contribution to gross CE/PE intrinsic payout."""
+
     result = df[["Strike", "CE OI", "PE OI"]].copy()
+
     result["CE Payout at Max Pain"] = (
         result["CE OI"] * np.maximum(settlement - result["Strike"], 0)
     )
+
     result["PE Payout at Max Pain"] = (
         result["PE OI"] * np.maximum(result["Strike"] - settlement, 0)
     )
+
     return result
 
 
-def largest_payout_contributors(contributions: pd.DataFrame, payout_column: str):
+def largest_payout_contributors(
+    contributions: pd.DataFrame,
+    payout_column: str
+):
     """Return all tied strikes with the largest single-strike contribution."""
+
     maximum = float(contributions[payout_column].max()) if not contributions.empty else 0.0
+
     if maximum <= 0:
         return [], maximum
-    mask = np.isclose(contributions[payout_column], maximum, rtol=1e-10, atol=1e-6)
+
+    mask = np.isclose(
+        contributions[payout_column],
+        maximum,
+        rtol=1e-10,
+        atol=1e-6
+    )
+
     strikes = contributions.loc[mask, "Strike"].astype(float).tolist()
+
     return strikes, maximum
 
 
+def lowest_positive_payout_contributors(
+    contributions: pd.DataFrame,
+    payout_column: str
+):
+    """
+    Return all tied strikes with the smallest strictly positive payout.
+
+    Zero-payout strikes are excluded.
+    """
+
+    positive = contributions.loc[contributions[payout_column] > 0]
+
+    if positive.empty:
+        return [], 0.0
+
+    minimum = float(positive[payout_column].min())
+
+    mask = np.isclose(
+        positive[payout_column],
+        minimum,
+        rtol=1e-10,
+        atol=1e-6
+    )
+
+    strikes = positive.loc[mask, "Strike"].astype(float).tolist()
+
+    return strikes, minimum
+
+
 def secret_value(key: str) -> str:
+
     value = os.getenv(key, "")
+
     try:
         if not value:
             value = str(st.secrets.get(key, ""))
     except Exception:
         pass
+
     return value.strip()
 
 
 # ----------------------------------- UI --------------------------------------
 st.title("NIFTY Options — Max Pain & Payout Dashboard")
-st.caption("Read-only FYERS API v3 analytics. This app does not place, modify or cancel orders.")
+
+st.caption(
+    "Read-only FYERS API v3 analytics. "
+    "This app does not place, modify or cancel orders."
+)
 
 with st.sidebar:
+
     st.header("FYERS connection")
-    client_id = st.text_input("Client ID", value=secret_value("FYERS_CLIENT_ID"),
-                              placeholder="YOUR_CLIENT_ID-100").strip()
-    access_token = st.text_input("Access token", value=secret_value("FYERS_ACCESS_TOKEN"),
-                                 type="password", placeholder="Current FYERS access token").strip()
+
+    client_id = st.text_input(
+        "Client ID",
+        value=secret_value("FYERS_CLIENT_ID"),
+        placeholder="YOUR_CLIENT_ID-100"
+    ).strip()
+
+    access_token = st.text_input(
+        "Access token",
+        value=secret_value("FYERS_ACCESS_TOKEN"),
+        type="password",
+        placeholder="Current FYERS access token"
+    ).strip()
+
     st.divider()
+
     st.header("Option-chain settings")
-    symbol = st.text_input("Underlying symbol", value=DEFAULT_SYMBOL).strip().upper()
-    strike_count = st.slider("Strikes on each side of ATM", 1, 50, 50,
-                             help="50 requests up to 50 ITM + ATM + 50 OTM strikes.")
+
+    symbol = st.text_input(
+        "Underlying symbol",
+        value=DEFAULT_SYMBOL
+    ).strip().upper()
+
+    strike_count = st.slider(
+        "Strikes on each side of ATM",
+        1,
+        50,
+        50,
+        help="50 requests up to 50 ITM + ATM + 50 OTM strikes."
+    )
+
     st.divider()
+
     auto_refresh = st.checkbox("Auto-refresh", value=False)
-    refresh_seconds = st.select_slider("Refresh interval", options=[15, 30, 45, 60, 90, 120, 180, 300],
-                                       value=30, format_func=lambda x: f"{x} seconds",
-                                       disabled=not auto_refresh)
+
+    refresh_seconds = st.select_slider(
+        "Refresh interval",
+        options=[15, 30, 45, 60, 90, 120, 180, 300],
+        value=30,
+        format_func=lambda x: f"{x} seconds",
+        disabled=not auto_refresh
+    )
+
     if st.button("Clear expiry cache", use_container_width=True):
         get_expiries.clear()
         st.rerun()
-
 if not client_id or not access_token:
     st.info("Enter your FYERS Client ID and current access token in the sidebar.")
     st.stop()
+
 if not symbol:
     st.error("Underlying symbol cannot be blank.")
     st.stop()
 
-if auto_refresh:
-    if st_autorefresh is None:
-        st.warning("Install streamlit-autorefresh to enable auto-refresh: pip install streamlit-autorefresh")
-    else:
-        st_autorefresh(interval=int(refresh_seconds * 1000), key="fyers_chain_refresh")
 
+# ------------------------------ Auto refresh --------------------------------
+if auto_refresh:
+
+    if st_autorefresh is None:
+        st.warning(
+            "Install streamlit-autorefresh to enable auto-refresh: "
+            "pip install streamlit-autorefresh"
+        )
+    else:
+        st_autorefresh(
+            interval=int(refresh_seconds * 1000),
+            key="fyers_chain_refresh"
+        )
+
+
+# ------------------------------ Expiry lookup -------------------------------
 try:
     expiries = get_expiries(client_id, access_token, symbol)
+
 except Exception as exc:
     st.error(f"Could not load expiry dates: {exc}")
     st.stop()
 
+
 expiry_labels = [
-    f"{e['date']}" + (f" | {e['flag']}" if e["flag"] else "") + f" [{e['expiry']}]"
+    f"{e['date']}" +
+    (f" | {e['flag']}" if e["flag"] else "") +
+    f" [{e['expiry']}]"
     for e in expiries
 ]
-expiry_by_label = {label: item["expiry"] for label, item in zip(expiry_labels, expiries)}
+
+expiry_by_label = {
+    label: item["expiry"]
+    for label, item in zip(expiry_labels, expiries)
+}
+
 
 with st.sidebar:
-    selected_expiry = st.selectbox("Expiry", expiry_labels, index=0)
-    expiry_timestamp = expiry_by_label[selected_expiry]
-    st.button("Fetch / refresh option chain", type="primary", use_container_width=True)
 
+    selected_expiry = st.selectbox(
+        "Expiry",
+        expiry_labels,
+        index=0
+    )
+
+    expiry_timestamp = expiry_by_label[selected_expiry]
+
+    st.button(
+        "Fetch / refresh option chain",
+        type="primary",
+        use_container_width=True
+    )
+
+
+# ------------------------------ Fetch chain ---------------------------------
 try:
     with st.spinner(f"Fetching {symbol} option chain..."):
-        payload = get_chain(client_id, access_token, symbol, strike_count, expiry_timestamp)
+
+        payload = get_chain(
+            client_id,
+            access_token,
+            symbol,
+            strike_count,
+            expiry_timestamp
+        )
+
 except Exception as exc:
     st.error(f"Option-chain request failed: {exc}")
     st.stop()
 
+
 chain = payload.get("optionsChain", [])
+
 if not isinstance(chain, list) or not chain:
     st.error("FYERS returned an empty optionsChain.")
     st.stop()
 
+
+# ------------------------------ Process data --------------------------------
 try:
     strike_df, warnings = make_strike_table(chain)
+
 except Exception as exc:
     st.error(f"Could not process option-chain data: {exc}")
     st.stop()
 
+
 underlying = get_underlying(chain)
+
 spot = num(underlying.get("ltp"))
 future = num(underlying.get("fp"))
+
 vix_data = payload.get("indiavixData", {})
 vix = num(vix_data.get("ltp")) if isinstance(vix_data, dict) else 0.0
+
 if spot <= 0:
-    spot = float(strike_df["Strike"].iloc[(strike_df["Strike"] - strike_df["Strike"].median()).abs().argmin()])
-    st.warning("Underlying LTP missing; the spot reference is approximated from the returned strikes.")
+    spot = float(
+        strike_df["Strike"].iloc[
+            (strike_df["Strike"] - strike_df["Strike"].median()).abs().argmin()
+        ]
+    )
 
+    st.warning(
+        "Underlying LTP missing; the spot reference is approximated "
+        "from the returned strikes."
+    )
+
+
+# ------------------------------ Calculations --------------------------------
 curves = payout_curves(strike_df)
-max_pain, ties, min_payout, mp_row = max_pain_level(curves, spot)
-ce_at_mp, pe_at_mp = float(mp_row["CE Payout"]), float(mp_row["PE Payout"])
-strike_contributions = strike_payout_contributions(strike_df, max_pain)
-ce_top_strikes, ce_top_payout = largest_payout_contributors(
-    strike_contributions, "CE Payout at Max Pain"
-)
-pe_top_strikes, pe_top_payout = largest_payout_contributors(
-    strike_contributions, "PE Payout at Max Pain"
-)
-lo, hi = float(strike_df["Strike"].min()), float(strike_df["Strike"].max())
 
+max_pain, ties, min_payout, mp_row = max_pain_level(curves, spot)
+
+ce_at_mp = float(mp_row["CE Payout"])
+pe_at_mp = float(mp_row["PE Payout"])
+
+
+strike_contributions = strike_payout_contributions(
+    strike_df,
+    max_pain
+)
+
+
+# Highest CE and PE contributions
+ce_top_strikes, ce_top_payout = largest_payout_contributors(
+    strike_contributions,
+    "CE Payout at Max Pain"
+)
+
+pe_top_strikes, pe_top_payout = largest_payout_contributors(
+    strike_contributions,
+    "PE Payout at Max Pain"
+)
+
+
+# Lowest positive CE and PE contributions
+ce_low_strikes, ce_low_payout = lowest_positive_payout_contributors(
+    strike_contributions,
+    "CE Payout at Max Pain"
+)
+
+pe_low_strikes, pe_low_payout = lowest_positive_payout_contributors(
+    strike_contributions,
+    "PE Payout at Max Pain"
+)
+
+
+lo = float(strike_df["Strike"].min())
+hi = float(strike_df["Strike"].max())
+
+
+# ------------------------------ Header --------------------------------------
 st.caption(
-    f"{symbol}  |  Expiry: {selected_expiry.split(' [')[0]}  |  "
+    f"{symbol}  |  "
+    f"Expiry: {selected_expiry.split(' [')[0]}  |  "
     f"Fetched: {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S IST')}  |  "
     f"Returned strikes: {len(strike_df)} ({lo:,.0f}–{hi:,.0f})"
 )
 
-m = st.columns(5)
-m[0].metric("Spot LTP", f"{spot:,.2f}")
-m[1].metric("Future (fp)", f"{future:,.2f}" if future else "—")
-m[2].metric("India VIX", f"{vix:.2f}" if vix else "—")
-atm = float(strike_df.iloc[(strike_df["Strike"] - spot).abs().argmin()]["Strike"])
-m[3].metric("ATM strike", f"{atm:,.0f}")
-m[4].metric("Max Pain", f"{max_pain:,.0f}", delta=f"{max_pain - spot:+,.0f} vs spot")
 
+# ------------------------------ Main metrics --------------------------------
+m = st.columns(5)
+
+m[0].metric("Spot LTP", f"{spot:,.2f}")
+
+m[1].metric(
+    "Future (fp)",
+    f"{future:,.2f}" if future else "—"
+)
+
+m[2].metric(
+    "India VIX",
+    f"{vix:.2f}" if vix else "—"
+)
+
+atm = float(
+    strike_df.iloc[
+        (strike_df["Strike"] - spot).abs().argmin()
+    ]["Strike"]
+)
+
+m[3].metric("ATM strike", f"{atm:,.0f}")
+
+m[4].metric(
+    "Max Pain",
+    f"{max_pain:,.0f}",
+    delta=f"{max_pain - spot:+,.0f} vs spot"
+)
+
+
+# ------------------------------ Warnings ------------------------------------
 for message in warnings:
     st.warning(message)
+
+
 if np.isclose(max_pain, lo) or np.isclose(max_pain, hi):
+
     st.warning(
         f"Max Pain is at the edge of the fetched range ({lo:,.0f}–{hi:,.0f}). "
-        "The true minimum may be outside this range. The API allows a maximum strikecount of 50."
+        "The true minimum may be outside this range. "
+        "The API allows a maximum strikecount of 50."
     )
+
+
 if len(ties) > 1:
-    st.info("Minimum payout is tied at: " + ", ".join(f"{x:,.0f}" for x in ties) +
-            f". Headline Max Pain is the tied strike closest to spot: {max_pain:,.0f}.")
 
+    st.info(
+        "Minimum payout is tied at: " +
+        ", ".join(f"{x:,.0f}" for x in ties) +
+        f". Headline Max Pain is the tied strike closest to spot: {max_pain:,.0f}."
+    )
+
+
+# ------------------------- Aggregate payout ---------------------------------
 st.subheader("Gross intrinsic payout at Max Pain")
+
 c = st.columns(3)
-c[0].metric("CE-side payout", f"₹{ce_at_mp:,.0f}")
-c[1].metric("PE-side payout", f"₹{pe_at_mp:,.0f}")
-c[2].metric("Combined payout", f"₹{min_payout:,.0f}")
-st.caption("Payout = FYERS OI quantity × intrinsic value. No additional lot-size multiplier is applied.")
 
-st.subheader("Strikes contributing the highest payout at Max Pain")
-st.caption(
-    f"Each strike's contribution is calculated at the selected Max Pain settlement price: "
-    f"{max_pain:,.0f}. These are the largest individual strike contributions to the aggregate "
-    "CE-side and PE-side intrinsic payouts, not separate CE/PE Max Pain levels."
+c[0].metric(
+    "CE-side payout",
+    f"₹{ce_at_mp:,.0f}"
 )
+
+c[1].metric(
+    "PE-side payout",
+    f"₹{pe_at_mp:,.0f}"
+)
+
+c[2].metric(
+    "Combined payout",
+    f"₹{min_payout:,.0f}"
+)
+
+st.caption(
+    "Payout = FYERS OI quantity × intrinsic value. "
+    "No additional lot-size multiplier is applied."
+)
+
+
+# ---------------------- Highest and lowest contributors ---------------------
+st.subheader(
+    "Highest and lowest positive strike contributions at Max Pain"
+)
+
+st.caption(
+    f"Each strike's contribution is calculated at the selected Max Pain "
+    f"settlement price: {max_pain:,.0f}. "
+    "Highest shows the largest single-strike contribution. "
+    "Lowest positive excludes zero-payout ATM/OTM strikes and shows the "
+    "smallest non-zero contribution among ITM strikes with positive OI. "
+    "These are contribution rankings, not separate CE/PE Max Pain levels."
+)
+
+
+# Highest contributors
 cp = st.columns(2)
+
 if ce_top_strikes:
+
     ce_label = ", ".join(f"{x:,.0f}" for x in ce_top_strikes)
-    cp[0].metric("Highest CE payout contribution", f"₹{ce_top_payout:,.0f}",
-                 delta=f"Strike: {ce_label}", delta_color="off")
+
+    cp[0].metric(
+        "Highest CE payout contribution",
+        f"₹{ce_top_payout:,.0f}",
+        delta=f"Strike: {ce_label}",
+        delta_color="off"
+    )
+
 else:
-    cp[0].metric("Highest CE payout contribution", "₹0", delta="No ITM CE contribution", delta_color="off")
+
+    cp[0].metric(
+        "Highest CE payout contribution",
+        "₹0",
+        delta="No ITM CE contribution",
+        delta_color="off"
+    )
+
+
 if pe_top_strikes:
+
     pe_label = ", ".join(f"{x:,.0f}" for x in pe_top_strikes)
-    cp[1].metric("Highest PE payout contribution", f"₹{pe_top_payout:,.0f}",
-                 delta=f"Strike: {pe_label}", delta_color="off")
+
+    cp[1].metric(
+        "Highest PE payout contribution",
+        f"₹{pe_top_payout:,.0f}",
+        delta=f"Strike: {pe_label}",
+        delta_color="off"
+    )
+
 else:
-    cp[1].metric("Highest PE payout contribution", "₹0", delta="No ITM PE contribution", delta_color="off")
 
+    cp[1].metric(
+        "Highest PE payout contribution",
+        "₹0",
+        delta="No ITM PE contribution",
+        delta_color="off"
+    )
+
+
+# Lowest positive contributors
+cp_low = st.columns(2)
+
+if ce_low_strikes:
+
+    ce_low_label = ", ".join(f"{x:,.0f}" for x in ce_low_strikes)
+
+    cp_low[0].metric(
+        "Lowest positive CE payout contribution",
+        f"₹{ce_low_payout:,.0f}",
+        delta=f"Strike: {ce_low_label}",
+        delta_color="off"
+    )
+
+else:
+
+    cp_low[0].metric(
+        "Lowest positive CE payout contribution",
+        "—",
+        delta="No positive ITM CE contribution",
+        delta_color="off"
+    )
+
+
+if pe_low_strikes:
+
+    pe_low_label = ", ".join(f"{x:,.0f}" for x in pe_low_strikes)
+
+    cp_low[1].metric(
+        "Lowest positive PE payout contribution",
+        f"₹{pe_low_payout:,.0f}",
+        delta=f"Strike: {pe_low_label}",
+        delta_color="off"
+    )
+
+else:
+
+    cp_low[1].metric(
+        "Lowest positive PE payout contribution",
+        "—",
+        delta="No positive ITM PE contribution",
+        delta_color="off"
+    )
+
+
+# ------------------------ Strike contribution table -------------------------
 with st.expander("Strike-by-strike payout contributions at Max Pain"):
-    contributions_view = strike_contributions.copy()
-    for col in ["CE OI", "PE OI", "CE Payout at Max Pain", "PE Payout at Max Pain"]:
-        contributions_view[col] = contributions_view[col].round(0).astype("int64")
-    st.dataframe(contributions_view, use_container_width=True, hide_index=True)
 
+    contributions_view = strike_contributions.copy()
+
+    for col in [
+        "CE OI",
+        "PE OI",
+        "CE Payout at Max Pain",
+        "PE Payout at Max Pain"
+    ]:
+
+        contributions_view[col] = (
+            contributions_view[col].round(0).astype("int64")
+        )
+
+    st.dataframe(
+        contributions_view,
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ------------------------------ Payout chart --------------------------------
 st.subheader("Expiry settlement payout curve")
-st.write("For each possible settlement price, the chart shows aggregate intrinsic payout to "
-         "CE holders, PE holders and both sides combined.")
+
+st.write(
+    "For each possible settlement price, the chart shows aggregate "
+    "intrinsic payout to CE holders, PE holders and both sides combined."
+)
+
 fig = go.Figure()
+
 for column, label, width in [
     ("CE Payout", "CE buyer payout", 2),
     ("PE Payout", "PE buyer payout", 2),
     ("Total Payout", "Combined payout", 4),
 ]:
-    fig.add_trace(go.Scatter(x=curves["Settlement"], y=curves[column],
-                             mode="lines+markers", name=label, line={"width": width}))
-fig.add_vline(x=max_pain, line_dash="dash", annotation_text=f"Max Pain {max_pain:,.0f}")
-fig.add_vline(x=spot, line_dash="dot", annotation_text=f"Spot {spot:,.0f}")
-fig.update_layout(height=490, xaxis_title="Hypothetical expiry settlement price",
-                  yaxis_title="Gross intrinsic payout (₹ estimate)", hovermode="x unified",
-                  margin={"l": 10, "r": 10, "t": 40, "b": 10})
+
+    fig.add_trace(
+        go.Scatter(
+            x=curves["Settlement"],
+            y=curves[column],
+            mode="lines+markers",
+            name=label,
+            line={"width": width}
+        )
+    )
+
+
+fig.add_vline(
+    x=max_pain,
+    line_dash="dash",
+    annotation_text=f"Max Pain {max_pain:,.0f}"
+)
+
+fig.add_vline(
+    x=spot,
+    line_dash="dot",
+    annotation_text=f"Spot {spot:,.0f}"
+)
+
+fig.update_layout(
+    height=490,
+    xaxis_title="Hypothetical expiry settlement price",
+    yaxis_title="Gross intrinsic payout (₹ estimate)",
+    hovermode="x unified",
+    margin={"l": 10, "r": 10, "t": 40, "b": 10}
+)
+
 fig.update_yaxes(tickformat=",.0f")
+
 st.plotly_chart(fig, use_container_width=True)
 
-with st.expander("How the calculations work — and why there are no separate CE Pain / PE Pain strikes", expanded=True):
+
+# ------------------------------ Explanation ---------------------------------
+with st.expander(
+    "How the calculations work — and why there are no separate CE Pain / PE Pain strikes",
+    expanded=True
+):
+
     st.markdown(r"""
 **CE payout at settlement S**
 
@@ -390,27 +821,68 @@ not useful independent pain levels. This dashboard therefore shows the separate 
 and their contributions at combined Max Pain instead.
 """)
 
+
+# ------------------------------ Option chain --------------------------------
 st.subheader("Option chain — returned strikes")
-st.caption("OI and OI change are shown as returned by FYERS. The payout curve uses current OI, not OI change.")
-cols = ["CE LTP", "CE OI", "CE OI Chg", "CE OI Chg %", "CE Volume", "CE Delta", "CE Gamma", "CE IV",
-        "Strike", "PE IV", "PE Gamma", "PE Delta", "PE Volume", "PE OI Chg %", "PE OI Chg", "PE OI", "PE LTP"]
-view = strike_df[cols].copy()
-for col in ["CE OI", "CE OI Chg", "CE Volume", "PE Volume", "PE OI Chg", "PE OI"]:
-    view[col] = view[col].round(0).astype("int64")
-st.dataframe(view, use_container_width=True, hide_index=True, height=620)
 
-with st.expander("Data coverage and API totals"):
-    st.write(f"OI sum in returned strikes — CE: {strike_df['CE OI'].sum():,.0f} | "
-             f"PE: {strike_df['PE OI'].sum():,.0f}")
-    st.write(f"FYERS aggregate callOi: {num(payload.get('callOi')):,.0f} | "
-             f"putOi: {num(payload.get('putOi')):,.0f}")
-    st.write("The aggregate callOi/putOi fields may cover more strikes than this request. "
-             "The payout curve uses only contracts present in optionsChain for the selected strike window.")
-
-st.divider()
 st.caption(
-    "Important: every open option contract has both a long and a short side. OI does not identify "
-    "which participant is the writer or their entry premium. These are gross expiry intrinsic-payout "
-    "calculations, not net trader P&L, a forecast, or evidence of deliberate price control. Premiums, "
-    "hedges, charges and positions outside the returned strike window are excluded."
+    "OI and OI change are shown as returned by FYERS. "
+    "The payout curve uses current OI, not OI change."
+)
+
+cols = [
+    "CE LTP", "CE OI", "CE OI Chg", "CE OI Chg %",
+    "CE Volume", "CE Delta", "CE Gamma", "CE IV",
+    "Strike",
+    "PE IV", "PE Gamma", "PE Delta", "PE Volume",
+    "PE OI Chg %", "PE OI Chg", "PE OI", "PE LTP"
+]
+
+view = strike_df[cols].copy()
+
+for col in [
+    "CE OI", "CE OI Chg", "CE Volume",
+    "PE Volume", "PE OI Chg", "PE OI"
+]:
+
+    view[col] = view[col].round(0).astype("int64")
+
+
+st.dataframe(
+    view,
+    use_container_width=True,
+    hide_index=True,
+    height=620
+)
+
+
+# ------------------------------ Data coverage -------------------------------
+with st.expander("Data coverage and API totals"):
+
+    st.write(
+        f"OI sum in returned strikes — "
+        f"CE: {strike_df['CE OI'].sum():,.0f} | "
+        f"PE: {strike_df['PE OI'].sum():,.0f}"
+    )
+
+    st.write(
+        f"FYERS aggregate callOi: {num(payload.get('callOi')):,.0f} | "
+        f"putOi: {num(payload.get('putOi')):,.0f}"
+    )
+
+    st.write(
+        "The aggregate callOi/putOi fields may cover more strikes than this request. "
+        "The payout curve uses only contracts present in optionsChain for the selected strike window."
+    )
+
+
+# -------------------------------- Footer -------------------------------------
+st.divider()
+
+st.caption(
+    "Important: every open option contract has both a long and a short side. "
+    "OI does not identify which participant is the writer or their entry premium. "
+    "These are gross expiry intrinsic-payout calculations, not net trader P&L, "
+    "a forecast, or evidence of deliberate price control. Premiums, hedges, "
+    "charges and positions outside the returned strike window are excluded."
 )
