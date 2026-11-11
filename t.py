@@ -1,8 +1,9 @@
-"""NIFTY 500 relative-strength scanner (Fyers WebSocket + Streamlit).
+"""NIFTY 500 ATP-distance scanner (Fyers WebSocket + Streamlit).
 
 Subscribes to the NIFTY 500 index and its constituents over the Fyers data
-socket, then ranks stocks by (stock % change - NIFTY 500 % change) so you can
-see the top N outperformers and top N underperformers live. Display only.
+socket, then ranks stocks by Distance % = (LTP - ATP) / ATP * 100, so you can
+see the stocks trading furthest above their average traded price (LONG
+candidates) and furthest below it (SHORT candidates) live.
 N is configurable from the sidebar (default 5).
 
 Run:  streamlit run t.py
@@ -45,9 +46,9 @@ GST_PCT = 0.18                # 18% on (brokerage + SEBI + transaction charges)
 STAMP_BUY_PCT = 0.00003       # 0.003% on the buy side
 
 MARKET_CLOSE = dtime(15, 30)
-APP_VERSION = "2026-10-30-recorder-v1"
-DISPLAY_COLS = ["Symbol", "FYERS Symbol", "Open", "LTP", "ATP", "From open %",
-                f"{INDEX_NAME} %", "Relative %", "Volume", "Age (s)"]
+APP_VERSION = "2026-11-11-distance-pct-v1"
+DISPLAY_COLS = ["Symbol", "FYERS Symbol", "Open", "LTP", "ATP", "Distance", "Distance %",
+                "From open %", f"{INDEX_NAME} %", "Relative %", "Volume", "Age (s)"]
 
 _TICKER_TEXT = """
 360ONE ABB ACC ACMESOLAR AIAENG APLAPOLLO AUBANK AWL AADHARHFC AARTIIND AAVAS
@@ -345,12 +346,12 @@ class MarketWSManager:
 
 def build_table(snap, symbols):
     index_q = snap.get(INDEX_SYMBOL, {})
-    index_chp = index_q.get("chp_open")  # % move since today's open; used for ranking
+    index_chp = index_q.get("chp_open")  # shown for context only; not used for ranking
     now = time.time()
     rows = []
     for ticker, sym in symbols.items():
         q = snap.get(sym, {})
-        chp = q.get("chp_open")  # % move since today's open; used for ranking
+        chp = q.get("chp_open")
         rel = (chp - index_chp) if (chp is not None and index_chp is not None) else None
         rows.append({
             "Symbol": ticker,
@@ -374,13 +375,21 @@ def build_table(snap, symbols):
                 "Relative %", "Volume", "Age (s)", "High", "Low", "Prev close",
                 "Bid", "Ask", "Buy qty", "Sell qty"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Ranking metric: distance of LTP from the average traded price.
+    #   Distance   = LTP - ATP          (rupees)
+    #   Distance % = (LTP - ATP) / ATP * 100   <- used for ranking
+    df["Distance"] = df["LTP"] - df["ATP"]
+    df["Distance %"] = df["Distance"] / df["ATP"] * 100
     return index_q, df
 
 
 def fmt_table(df):
     df = df[[c for c in DISPLAY_COLS if c in df.columns]]
     return df.style.format({
-        "Open": "{:,.2f}", "LTP": "{:,.2f}", "ATP": "{:,.2f}", "From open %": "{:+.2f}%",
+        "Open": "{:,.2f}", "LTP": "{:,.2f}", "ATP": "{:,.2f}",
+        "Distance": "{:+,.2f}", "Distance %": "{:+.2f}%",
+        "From open %": "{:+.2f}%",
         f"{INDEX_NAME} %": "{:+.2f}%",
         "Relative %": "{:+.2f}%", "Volume": "{:,.0f}", "Age (s)": "{:.1f}",
     }, na_rep="—")
@@ -390,17 +399,21 @@ README_TEXT = """STRATEGY DATA EXPORT
 ====================
 One folder = one trading day. All times are IST (ISO 8601, +05:30).
 
+Strategy: rank by Distance % = (LTP - ATP) / ATP * 100. LONG the largest positive
+distances, SHORT the largest negative distances.
+
 market_snapshots.csv   Every N seconds (default 60) for EVERY stock with a live quote:
-                       Time, Symbol, LTP, Open, High, Low, Prev close, ATP, Bid, Ask,
-                       Volume, Buy qty, Sell qty, From open %, Index %, Relative %,
-                       Age (s), Rank (1 = strongest relative %), Candidate
-                       (LONG / SHORT = in the tradable top/bottom lists at that moment).
+                       Time, Symbol, LTP, Open, High, Low, Prev close, ATP, Distance,
+                       Distance %, Bid, Ask, Volume, Buy qty, Sell qty, From open %,
+                       Index %, Relative %, Age (s), Rank (1 = largest Distance %),
+                       Candidate (LONG / SHORT = in the tradable top/bottom lists at
+                       that moment).
 index_series.csv       NIFTY 500 index: LTP, Open, High, Low, Prev close, From open %.
 rebalance_events.csv   One row per stock per rebalance: HOLD / EXIT / ENTER / SKIP,
-                       with the reason, price, relative %, and quantity.
+                       with the reason, price, distance %, and quantity.
 trades.csv             Every closed paper trade: entry/exit, gross/net P&L, charges,
                        hold minutes, MFE % (best move in your favour), MAE % (worst move
-                       against you), entry relative %, entry/exit spread %, reason.
+                       against you), entry distance %, entry/exit spread %, reason.
 equity_curve.csv       Realized / unrealized / charges / net P&L and open long/short counts.
 config_changes.csv     Every settings combination used during the day, with the time.
 run_config.json        Settings at export time and app version.
@@ -486,13 +499,15 @@ class DataRecorder:
         cand.update({s: "SHORT" for s in bottom["Symbol"]})
         out = pd.DataFrame({"Time": ts, "Symbol": live["Symbol"].to_numpy()})
         for src, dst in [("LTP", "LTP"), ("Open", "Open"), ("High", "High"), ("Low", "Low"),
-                         ("Prev close", "Prev close"), ("ATP", "ATP"), ("Bid", "Bid"),
-                         ("Ask", "Ask"), ("Volume", "Volume"), ("Buy qty", "Buy qty"),
-                         ("Sell qty", "Sell qty"), ("From open %", "From open %"),
+                         ("Prev close", "Prev close"), ("ATP", "ATP"),
+                         ("Distance", "Distance"), ("Distance %", "Distance %"),
+                         ("Bid", "Bid"), ("Ask", "Ask"), ("Volume", "Volume"),
+                         ("Buy qty", "Buy qty"), ("Sell qty", "Sell qty"),
+                         ("From open %", "From open %"),
                          (f"{INDEX_NAME} %", "Index %"), ("Relative %", "Relative %"),
                          ("Age (s)", "Age (s)")]:
             out[dst] = live[src].to_numpy()
-        out["Rank"] = live["Relative %"].rank(ascending=False, method="first").to_numpy()
+        out["Rank"] = live["Distance %"].rank(ascending=False, method="first").to_numpy()
         out["Candidate"] = live["Symbol"].map(cand).fillna("").to_numpy()
         self.append(now, "market_snapshots", out.round(4))
 
@@ -607,7 +622,8 @@ def _event(now, rnd, sym, action, side, ltp, quotes, qty=None, per_stock=None, n
     return {
         "Time": now.isoformat(timespec="seconds"), "Round": rnd, "Symbol": sym,
         "Action": action, "Side": side, "LTP": ltp,
-        "Relative %": q.get("Relative %"), "From open %": q.get("From open %"),
+        "Distance %": q.get("Distance %"), "Relative %": q.get("Relative %"),
+        "From open %": q.get("From open %"),
         "Qty": qty, "Per stock": per_stock, "Note": note,
     }
 
@@ -664,9 +680,11 @@ def paper_close_one(state, cfg, now, ltp_map, sym, reason):
             "Hold min": (now - pos["entry_time"]).total_seconds() / 60,
             "MFE %": mfe, "MAE %": mae, "Reason": reason,
             "Round at entry": ctx.get("round"),
+            "Entry Distance %": ctx.get("dist_pct"),
             "Entry Relative %": ctx.get("rel"), "Entry From open %": ctx.get("from_open"),
             "Entry ATP": ctx.get("atp"), "Entry Volume": ctx.get("volume"),
             "Entry spread %": ctx.get("spread"),
+            "Exit Distance %": q.get("Distance %"),
             "Exit Relative %": q.get("Relative %"), "Exit spread %": spread_pct(q),
         })
     del state["positions"][sym]
@@ -773,7 +791,8 @@ def paper_step(state, cfg, now, top, bottom, ltp_map, force=False, quotes=None):
         if sym in state["positions"]:
             continue
         q = qts.get(sym, {})
-        ctx = {"round": rnd, "rel": q.get("Relative %"), "from_open": q.get("From open %"),
+        ctx = {"round": rnd, "dist_pct": q.get("Distance %"), "rel": q.get("Relative %"),
+               "from_open": q.get("From open %"),
                "atp": q.get("ATP"), "volume": q.get("Volume"), "spread": spread_pct(q)}
         paper_open(state, cfg, now, sym, side, ltp, per_stock, ctx)
         if sym in state["positions"]:
@@ -968,14 +987,15 @@ def render_paper_section(state, cfg, now, ltp_map):
 
 def main():
     st.set_page_config(
-        page_title=f"{INDEX_NAME} Relative Strength",
+        page_title=f"{INDEX_NAME} ATP Distance",
         page_icon="📈",
         layout="wide",
     )
-    st.title(f"{INDEX_NAME} · Outperformers vs Underperformers")
+    st.title(f"{INDEX_NAME} · Stocks furthest above / below ATP")
     st.caption(
-        f"Relative % = stock % move since today's open − {INDEX_NAME} % move since today's open. "
-        "Exact stock symbols are resolved from FYERS NSE_CM.csv. Live via WebSocket. Display only."
+        "Distance % = (LTP − ATP) / ATP × 100, where ATP is the day's average traded price. "
+        "Longs = largest positive distance, shorts = largest negative distance. "
+        "Exact stock symbols are resolved from FYERS NSE_CM.csv. Live via WebSocket."
     )
 
     recorder = get_recorder()
@@ -990,7 +1010,7 @@ def main():
         st.header("Filters")
         top_n = st.number_input(
             "Top N to show", min_value=1, max_value=100, value=TOP_N, step=1,
-            help="How many top outperformers and underperformers to display.",
+            help="How many top positive-distance and top negative-distance stocks to show.",
         )
         min_vol = st.number_input(
             "Min volume today", min_value=0, value=0, step=10000,
@@ -1000,8 +1020,8 @@ def main():
         st.header("Paper trading")
         paper_on = st.checkbox(
             "Paper trade mode", value=False,
-            help="Long the top outperformers and short the top underperformers, "
-                 "rebalancing on every round interval.",
+            help="Long the stocks with the largest positive Distance % and short the "
+                 "largest negative Distance %, rebalancing on every round interval.",
         )
         paper_capital = st.number_input(
             "Capital (₹)", min_value=0.0, value=100000.0, step=1000.0,
@@ -1034,7 +1054,8 @@ def main():
                  "day (a few MB zipped). Lower values give finer data and bigger files.",
         )
         settings = {
-            "app_version": APP_VERSION, "top_n": int(top_n), "min_volume": int(min_vol),
+            "app_version": APP_VERSION, "rank_by": "Distance % = (LTP-ATP)/ATP",
+            "top_n": int(top_n), "min_volume": int(min_vol),
             "paper_on": bool(paper_on), "capital": float(paper_capital),
             "rebalance_min": int(rebalance_min), "square_off": square_off_t.strftime("%H:%M"),
             "charges_on": bool(charges_on), "snapshot_s": int(sample_s),
@@ -1161,7 +1182,8 @@ def main():
             )
             st.dataframe(unresolved_df, hide_index=True, width="stretch")
 
-    live = df.dropna(subset=["Relative %"]).copy()
+    # Only stocks with both LTP and ATP can be ranked by distance.
+    live = df.dropna(subset=["Distance %"]).copy()
     if min_vol:
         live = live[live["Volume"].fillna(0) >= min_vol]
 
@@ -1191,31 +1213,17 @@ def main():
     if mgr.last_error:
         st.warning(f"WebSocket message: {mgr.last_error}")
 
-    if index_change is None:
-        st.info(
-            f"Waiting for the {INDEX_NAME} index tick with an open price. "
-            "If this never clears, check whether the index feed is sending open_price."
-        )
-        with st.expander("Raw index quote"):
-            st.json(index_q)
-        return
-
     if live.empty:
-        st.info("Waiting for stock ticks with both LTP and today's open price.")
+        st.info("Waiting for stock ticks with both LTP and ATP (average traded price).")
         return
 
-    ranked = live.sort_values("Relative %", ascending=False).reset_index(drop=True)
+    ranked = live.sort_values("Distance %", ascending=False).reset_index(drop=True)
     n = int(top_n)
 
-    # Outperformers must trade above their average traded price (ATP);
-    # underperformers must trade below it. Stocks without an ATP are excluded.
-    ltp_s = pd.to_numeric(ranked["LTP"], errors="coerce")
-    atp_s = pd.to_numeric(ranked["ATP"], errors="coerce")
-    valid = ltp_s.notna() & atp_s.notna()
-    above_atp = ranked[valid & (ltp_s > atp_s)]
-    below_atp = ranked[valid & (ltp_s < atp_s)]
-    top = above_atp.sort_values("Relative %", ascending=False).head(n).copy()
-    bottom = below_atp.sort_values("Relative %", ascending=True).head(n).copy()
+    # Longs: largest positive Distance % (LTP above ATP).
+    # Shorts: largest negative Distance % (LTP below ATP).
+    top = ranked[ranked["Distance %"] > 0].sort_values("Distance %", ascending=False).head(n).copy()
+    bottom = ranked[ranked["Distance %"] < 0].sort_values("Distance %", ascending=True).head(n).copy()
 
     # Paper trading engine: runs once per refresh on the current top/bottom lists.
     now_ist = datetime.now(IST)
@@ -1244,21 +1252,21 @@ def main():
 
     left, right = st.columns(2, gap="large")
     with left:
-        st.subheader(f"🟢 Top {n} outperformers (LTP > ATP)")
+        st.subheader(f"🟢 Top {n} above ATP · LONG (largest +Distance %)")
         if top.empty:
             st.info("No stocks currently qualify (need LTP above average traded price).")
         else:
             st.dataframe(fmt_table(top), hide_index=True, width="stretch")
     with right:
-        st.subheader(f"🔴 Top {n} underperformers (LTP < ATP)")
+        st.subheader(f"🔴 Top {n} below ATP · SHORT (largest −Distance %)")
         if bottom.empty:
             st.info("No stocks currently qualify (need LTP below average traded price).")
         else:
             st.dataframe(fmt_table(bottom), hide_index=True, width="stretch")
 
-    st.subheader(f"Extremes · top {n} and bottom {n} by relative % (ATP-filtered)")
+    st.subheader(f"Extremes · top {n} and bottom {n} by Distance %")
     extremes = pd.concat([top, bottom]).drop_duplicates("Symbol")
-    st.bar_chart(extremes.set_index("Symbol")["Relative %"], height=320)
+    st.bar_chart(extremes.set_index("Symbol")["Distance %"], height=320)
 
     metrics = render_paper_section(paper, paper_cfg, now_ist, ltp_map)
     if do_sample and metrics:
@@ -1271,7 +1279,7 @@ def main():
         st.download_button(
             "Export CSV",
             ranked.to_csv(index=False).encode("utf-8"),
-            file_name=f"nifty500_relative_{datetime.now(IST):%Y%m%d_%H%M%S}.csv",
+            file_name=f"nifty500_atp_distance_{datetime.now(IST):%Y%m%d_%H%M%S}.csv",
             mime="text/csv",
         )
 
@@ -1285,14 +1293,14 @@ def main():
 
     missing = [
         ticker
-        for ticker in df.loc[df["Relative %"].isna(), "Symbol"].tolist()
+        for ticker in df.loc[df["Distance %"].isna(), "Symbol"].tolist()
         if ticker not in rejected_tickers
     ]
     if missing:
         with st.expander(f"No usable quote yet · {len(missing)} symbols"):
             st.write(", ".join(missing))
             st.caption(
-                "These symbols have not yet received both LTP and today's open price. "
+                "These symbols have not yet received both LTP and ATP (average traded price). "
                 "They may be waiting for their first tick."
             )
 
