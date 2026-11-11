@@ -2,8 +2,8 @@
 
 Subscribes to the NIFTY 500 index and its constituents over the Fyers data
 socket, then ranks stocks by Distance % = (LTP - ATP) / ATP * 100, so you can
-see the stocks trading furthest above their average traded price (LONG
-candidates) and furthest below it (SHORT candidates) live.
+see the stocks trading furthest above their average traded price (SHORT
+candidates) and furthest below it (LONG candidates) live.
 N is configurable from the sidebar (default 5).
 
 Run:  streamlit run t.py
@@ -46,7 +46,7 @@ GST_PCT = 0.18                # 18% on (brokerage + SEBI + transaction charges)
 STAMP_BUY_PCT = 0.00003       # 0.003% on the buy side
 
 MARKET_CLOSE = dtime(15, 30)
-APP_VERSION = "2026-11-11-distance-pct-v1"
+APP_VERSION = "2026-11-11-distance-pct-reversion-v1"
 DISPLAY_COLS = ["Symbol", "FYERS Symbol", "Open", "LTP", "ATP", "Distance", "Distance %",
                 "From open %", f"{INDEX_NAME} %", "Relative %", "Volume", "Age (s)"]
 
@@ -399,8 +399,8 @@ README_TEXT = """STRATEGY DATA EXPORT
 ====================
 One folder = one trading day. All times are IST (ISO 8601, +05:30).
 
-Strategy: rank by Distance % = (LTP - ATP) / ATP * 100. LONG the largest positive
-distances, SHORT the largest negative distances.
+Strategy: rank by Distance % = (LTP - ATP) / ATP * 100. SHORT the largest positive
+distances (furthest above ATP), LONG the largest negative distances (furthest below ATP).
 
 market_snapshots.csv   Every N seconds (default 60) for EVERY stock with a live quote:
                        Time, Symbol, LTP, Open, High, Low, Prev close, ATP, Distance,
@@ -495,8 +495,8 @@ class DataRecorder:
         if live.empty:
             return
         ts = now.isoformat(timespec="seconds")
-        cand = {s: "LONG" for s in top["Symbol"]}
-        cand.update({s: "SHORT" for s in bottom["Symbol"]})
+        cand = {s: "SHORT" for s in top["Symbol"]}
+        cand.update({s: "LONG" for s in bottom["Symbol"]})
         out = pd.DataFrame({"Time": ts, "Symbol": live["Symbol"].to_numpy()})
         for src, dst in [("LTP", "LTP"), ("Open", "Open"), ("High", "High"), ("Low", "Low"),
                          ("Prev close", "Prev close"), ("ATP", "ATP"),
@@ -751,8 +751,9 @@ def paper_step(state, cfg, now, top, bottom, ltp_map, force=False, quotes=None):
     state["last_key"] = key
 
     # Target book for this round: symbol -> (side, ltp).
-    target = {r["Symbol"]: ("LONG", r["LTP"]) for _, r in top.iterrows()}
-    target.update({r["Symbol"]: ("SHORT", r["LTP"]) for _, r in bottom.iterrows()})
+    # Mean-reversion: SHORT the stocks furthest above ATP, LONG those furthest below it.
+    target = {r["Symbol"]: ("SHORT", r["LTP"]) for _, r in top.iterrows()}
+    target.update({r["Symbol"]: ("LONG", r["LTP"]) for _, r in bottom.iterrows()})
     state["rounds"] += 1
     rnd = state["rounds"]
     state["last_rebalance"] = now
@@ -994,7 +995,7 @@ def main():
     st.title(f"{INDEX_NAME} · Stocks furthest above / below ATP")
     st.caption(
         "Distance % = (LTP − ATP) / ATP × 100, where ATP is the day's average traded price. "
-        "Longs = largest positive distance, shorts = largest negative distance. "
+        "Shorts = largest positive distance, longs = largest negative distance. "
         "Exact stock symbols are resolved from FYERS NSE_CM.csv. Live via WebSocket."
     )
 
@@ -1010,7 +1011,7 @@ def main():
         st.header("Filters")
         top_n = st.number_input(
             "Top N to show", min_value=1, max_value=100, value=TOP_N, step=1,
-            help="How many top positive-distance and top negative-distance stocks to show.",
+            help="How many top positive-distance (short) and top negative-distance (long) stocks to show.",
         )
         min_vol = st.number_input(
             "Min volume today", min_value=0, value=0, step=10000,
@@ -1020,7 +1021,7 @@ def main():
         st.header("Paper trading")
         paper_on = st.checkbox(
             "Paper trade mode", value=False,
-            help="Long the stocks with the largest positive Distance % and short the "
+            help="Short the stocks with the largest positive Distance % and long the "
                  "largest negative Distance %, rebalancing on every round interval.",
         )
         paper_capital = st.number_input(
@@ -1220,8 +1221,8 @@ def main():
     ranked = live.sort_values("Distance %", ascending=False).reset_index(drop=True)
     n = int(top_n)
 
-    # Longs: largest positive Distance % (LTP above ATP).
-    # Shorts: largest negative Distance % (LTP below ATP).
+    # `top`    = largest positive Distance % (LTP above ATP)  -> traded SHORT.
+    # `bottom` = largest negative Distance % (LTP below ATP)  -> traded LONG.
     top = ranked[ranked["Distance %"] > 0].sort_values("Distance %", ascending=False).head(n).copy()
     bottom = ranked[ranked["Distance %"] < 0].sort_values("Distance %", ascending=True).head(n).copy()
 
@@ -1252,13 +1253,13 @@ def main():
 
     left, right = st.columns(2, gap="large")
     with left:
-        st.subheader(f"🟢 Top {n} above ATP · LONG (largest +Distance %)")
+        st.subheader(f"🔴 Top {n} above ATP · SHORT (largest +Distance %)")
         if top.empty:
             st.info("No stocks currently qualify (need LTP above average traded price).")
         else:
             st.dataframe(fmt_table(top), hide_index=True, width="stretch")
     with right:
-        st.subheader(f"🔴 Top {n} below ATP · SHORT (largest −Distance %)")
+        st.subheader(f"🟢 Top {n} below ATP · LONG (largest −Distance %)")
         if bottom.empty:
             st.info("No stocks currently qualify (need LTP below average traded price).")
         else:
