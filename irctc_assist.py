@@ -943,8 +943,8 @@ def dump_elements(page):
 
 
 def main():
-    user = "shubh8772"
-    pwd = "PassworD@1357"
+    user = ""
+    pwd = ""
     debug = 1
 
     log("start", f"user={'set' if user else 'MISSING'}, "
